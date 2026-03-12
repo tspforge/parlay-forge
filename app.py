@@ -35,9 +35,9 @@ MODE_CONFIG = {
         "chalk_penalty": 0.05,
         "dog_penalty": 0.07,
         "volatility_weight": 0.06,
-        "score_hit": 0.72,
-        "score_ev": 0.18,
-        "score_line": 0.10,
+        "score_hit": 0.70,
+        "score_ev": 0.22,
+        "score_line": 0.08,
     },
     "balanced": {
         "label": "Balanced",
@@ -46,8 +46,8 @@ MODE_CONFIG = {
         "chalk_penalty": 0.04,
         "dog_penalty": 0.06,
         "volatility_weight": 0.08,
-        "score_hit": 0.62,
-        "score_ev": 0.24,
+        "score_hit": 0.58,
+        "score_ev": 0.28,
         "score_line": 0.14,
     },
     "aggressive": {
@@ -57,14 +57,15 @@ MODE_CONFIG = {
         "chalk_penalty": 0.03,
         "dog_penalty": 0.05,
         "volatility_weight": 0.10,
-        "score_hit": 0.52,
-        "score_ev": 0.28,
+        "score_hit": 0.48,
+        "score_ev": 0.32,
         "score_line": 0.20,
     },
 }
 
 WINDOW_HOURS = 24
 TOP_N = 5
+MAX_SINGLE_LEG_FAVORITE = -350
 app = Flask(__name__)
 
 
@@ -109,6 +110,10 @@ def ev_per_dollar(win_prob, american):
     decimal = american_to_decimal(american)
     profit_if_win = decimal - 1
     return (win_prob * profit_if_win) - (1 - win_prob)
+
+
+def format_american(american):
+    return f"+{american}" if american > 0 else str(american)
 
 
 # ---------------- TIME ----------------
@@ -210,19 +215,7 @@ def fetch_games(book):
     return games
 
 
-def fetch_line_movement_snapshot(sport, event_id, bookmaker):
-    """
-    Placeholder for future historical line movement.
-    The Odds API endpoint here is not true historical movement.
-    We fake a lightweight signal from current pricing shape so the UI has room for a real upgrade later.
-    """
-    bias = 0.0
-    if sport == "Mixed Martial Arts":
-        bias -= 0.01
-    return bias
-
-
-# ---------------- MODELS ----------------
+# ---------------- MODEL HEURISTICS ----------------
 
 def sport_volatility(sport):
     if sport == "Mixed Martial Arts":
@@ -237,10 +230,6 @@ def sport_volatility(sport):
 
 
 def infer_injury_risk(game, leg):
-    """
-    Placeholder until we wire in real injury / lineup feeds.
-    Small heuristic only.
-    """
     risk = 0.0
 
     if game["sport"] == "American Football":
@@ -249,7 +238,7 @@ def infer_injury_risk(game, leg):
     elif game["sport"] == "Baseball":
         risk += 0.008
     elif game["sport"] == "Mixed Martial Arts":
-        risk += 0.01
+        risk += 0.010
 
     return risk
 
@@ -259,14 +248,14 @@ def infer_public_side_penalty(leg):
     if price <= -220:
         return 0.018
     if price <= -160:
-        return 0.01
+        return 0.010
     return 0.0
 
 
 def infer_qb_or_pitcher_penalty(game):
     sport = game["sport"]
     if sport == "American Football":
-        return 0.01
+        return 0.010
     if sport == "Baseball":
         return 0.015
     return 0.0
@@ -291,7 +280,6 @@ def adjust_probability(game, leg, mode_key):
     prob -= infer_injury_risk(game, leg)
     prob -= infer_public_side_penalty(leg)
     prob -= infer_qb_or_pitcher_penalty(game)
-    prob += fetch_line_movement_snapshot(game["sport"], game["event_id"], game["book"])
 
     return max(0.01, min(0.99, prob))
 
@@ -332,6 +320,9 @@ def find_parlays(mode_key):
                     if not (mode["min_odds"] <= odds <= mode["max_odds"]):
                         continue
 
+                    if l1["price"] < MAX_SINGLE_LEG_FAVORITE or l2["price"] < MAX_SINGLE_LEG_FAVORITE:
+                        continue
+
                     p1 = adjust_probability(g1, l1, mode_key)
                     p2 = adjust_probability(g2, l2, mode_key)
                     sim_hit = simulate(p1, p2, SIMULATION_COUNT)
@@ -340,6 +331,10 @@ def find_parlays(mode_key):
                     edge = sim_hit - break_even
                     ev = ev_per_dollar(sim_hit, odds)
                     line_value = ((l1["prob"] - p1) + (l2["prob"] - p2)) * -1
+
+                    # V5 core rule: no negative EV bets
+                    if ev <= 0:
+                        continue
 
                     score = (
                         sim_hit * mode["score_hit"]
@@ -354,6 +349,7 @@ def find_parlays(mode_key):
                             "leg1": {
                                 "team": l1["team"],
                                 "price": l1["price"],
+                                "price_display": format_american(l1["price"]),
                                 "prob": p1,
                                 "raw_prob": l1["prob"],
                                 "sport": g1["sport"],
@@ -363,6 +359,7 @@ def find_parlays(mode_key):
                             "leg2": {
                                 "team": l2["team"],
                                 "price": l2["price"],
+                                "price_display": format_american(l2["price"]),
                                 "prob": p2,
                                 "raw_prob": l2["prob"],
                                 "sport": g2["sport"],
@@ -370,6 +367,7 @@ def find_parlays(mode_key):
                                 "time": g2["display_time"],
                             },
                             "odds": odds,
+                            "odds_display": format_american(odds),
                             "hit": sim_hit,
                             "baseline_hit": baseline_hit,
                             "break_even": break_even,
@@ -380,13 +378,15 @@ def find_parlays(mode_key):
                         }
                     )
 
-        market_counts.append({
-            "book": BOOKMAKERS[book],
-            "games": len(games),
-            "candidates": local_count,
-        })
+        market_counts.append(
+            {
+                "book": BOOKMAKERS[book],
+                "games": len(games),
+                "candidates": local_count,
+            }
+        )
 
-    candidates.sort(key=lambda x: (x["score"], x["hit"], x["ev"], x["edge"]), reverse=True)
+    candidates.sort(key=lambda x: (x["score"], x["ev"], x["hit"], x["edge"]), reverse=True)
 
     top = candidates[:TOP_N]
     for idx, item in enumerate(top):
@@ -403,7 +403,7 @@ HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Parlay Forge V4</title>
+  <title>Parlay Forge V5</title>
   <style>
     :root {
       --bg: #08080b;
@@ -414,7 +414,6 @@ HTML = """
       --muted: #a6a6b0;
       --orange: #ff6a00;
       --gold: #ffbc6b;
-      --ember: #ff8c3a;
     }
     * { box-sizing: border-box; }
     body {
@@ -436,13 +435,6 @@ HTML = """
         linear-gradient(180deg, rgba(255,106,0,.10), rgba(255,106,0,.025)),
         linear-gradient(180deg, rgba(255,255,255,.02), rgba(255,255,255,.01));
       box-shadow: 0 0 0 1px rgba(255,106,0,.05), 0 24px 80px rgba(0,0,0,.36);
-    }
-    .hero:before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      background: radial-gradient(circle at 88% 10%, rgba(255,188,107,.14), transparent 24%);
     }
     .eyebrow {
       color: var(--gold);
@@ -497,13 +489,6 @@ HTML = """
       border: 1px solid var(--line);
       padding: 20px;
       background: linear-gradient(180deg, var(--panel), var(--panel2));
-    }
-    .card:before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      background: radial-gradient(circle at top right, rgba(255,106,0,.14), transparent 34%);
     }
     .rankrow {
       display: flex;
@@ -583,16 +568,16 @@ HTML = """
 <body>
   <div class="wrap">
     <div class="hero">
-      <div class="eyebrow">Forge Mode // V4</div>
+      <div class="eyebrow">Forge Mode // V5</div>
       <h1>Parlay Forge</h1>
-      <p class="sub">Scans NBA, NFL, MLB, and UFC/MMA games in the next 24 hours. Checks FanDuel, DraftKings, BetMGM, and Caesars. Ranks top 5 two-leg parlays using simulated hit rate, EV, and line-quality adjustments. Injury, QB, pitcher, and public-bias logic are heuristic placeholders for now, but the engine is ready for real feeds.</p>
+      <p class="sub">Scans NBA, NFL, MLB, and UFC/MMA games in the next 24 hours. Checks FanDuel, DraftKings, BetMGM, and Caesars. Only shows positive-EV 2-leg parlays and filters out extreme chalk traps.</p>
       <form method="post" class="controls">
         <select name="mode">
           <option value="safe" {% if mode == 'safe' %}selected{% endif %}>Safe</option>
           <option value="balanced" {% if mode == 'balanced' %}selected{% endif %}>Balanced</option>
           <option value="aggressive" {% if mode == 'aggressive' %}selected{% endif %}>Aggressive</option>
         </select>
-        <button type="submit">Forge V4 Parlays</button>
+        <button type="submit">Forge V5 Parlays</button>
       </form>
       {% if results is not none %}
         <div class="meta">Mode: {{ mode_label }} · Simulations per candidate: {{ sim_count }} · Top results shown: {{ top_n }}</div>
@@ -611,7 +596,7 @@ HTML = """
               <div class="rank">Rank {{ loop.index }}</div>
               <div class="confidence">{{ p.confidence }}</div>
             </div>
-            <div class="odds">{{ p.odds }}</div>
+            <div class="odds">{{ p.odds_display }}</div>
             <div>
               <span class="metric">Book: {{ p.book }}</span>
               <span class="metric">Sim hit: {{ '%.2f'|format(p.hit*100) }}%</span>
@@ -620,14 +605,14 @@ HTML = """
             </div>
 
             <div class="leg">
-              <div class="team">{{ p.leg1.team }} ({{ p.leg1.price }})</div>
+              <div class="team">{{ p.leg1.team }} ({{ p.leg1.price_display }})</div>
               <div class="small">{{ p.leg1.game }}</div>
               <div class="small">{{ p.leg1.sport }} · {{ p.leg1.time }}</div>
               <div class="small">Adj win rate: {{ '%.2f'|format(p.leg1.prob*100) }}% · Raw: {{ '%.2f'|format(p.leg1.raw_prob*100) }}%</div>
             </div>
 
             <div class="leg">
-              <div class="team">{{ p.leg2.team }} ({{ p.leg2.price }})</div>
+              <div class="team">{{ p.leg2.team }} ({{ p.leg2.price_display }})</div>
               <div class="small">{{ p.leg2.game }}</div>
               <div class="small">{{ p.leg2.sport }} · {{ p.leg2.time }}</div>
               <div class="small">Adj win rate: {{ '%.2f'|format(p.leg2.prob*100) }}% · Raw: {{ '%.2f'|format(p.leg2.raw_prob*100) }}%</div>
@@ -645,7 +630,7 @@ HTML = """
             <div class="summaryitem">
               <strong>{{ item.book }}</strong>
               <div class="small">Games found: {{ item.games }}</div>
-              <div class="small">Candidates built: {{ item.candidates }}</div>
+              <div class="small">Positive-EV candidates: {{ item.candidates }}</div>
             </div>
           {% endfor %}
         </div>
@@ -670,7 +655,7 @@ def home():
         try:
             results, market_counts = find_parlays(mode)
             if not results:
-                error = "No candidates found in this mode for games starting in the next 24 hours. Try another mode or widen the ranges."
+                error = "No positive EV parlays found in the next 24 hours. No bet today."
         except Exception as e:
             error = str(e)
             results = []
