@@ -1,270 +1,513 @@
-from flask import Flask, render_template_string, request
-import os
-import random
-from datetime import datetime, timedelta, timezone
-import requests
-from dotenv import load_dotenv
-
-load_dotenv()
-
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-PORT = int(os.getenv("PORT", 10000))
-SIMULATION_COUNT = int(os.getenv("SIMULATION_COUNT", "100000"))
-
-BOOKMAKERS = ["fanduel","draftkings","betmgm","caesars"]
-
-SPORTS = [
-"basketball_nba",
-"americanfootball_nfl",
-"baseball_mlb",
-"mma_mixed_martial_arts"
-]
-
-WINDOW_HOURS = 48
-TOP_N = 5
-
-SINGLE_THRESHOLDS = {
-"safe":0.70,
-"balanced":0.50,
-"aggressive":0.30
-}
-
-AGGRESSIVE_MIN_PRICE = 120
+from flask import Flask, request, render_template_string
+from typing import List, Dict, Any
 
 app = Flask(__name__)
 
+# -------------------------------------------------------------------
+# SAMPLE DATA
+# Replace this later with your real odds/model feed.
+# -------------------------------------------------------------------
+BETS: List[Dict[str, Any]] = [
+    {
+        "team": "Detroit Pistons",
+        "odds": -1350,
+        "sim_hit": 89.50,
+        "ev": -3.87,
+        "matchup": "Memphis Grizzlies @ Detroit Pistons",
+        "sport": "NBA",
+        "book": "FanDuel",
+    },
+    {
+        "team": "Detroit Pistons",
+        "odds": -1200,
+        "sim_hit": 88.70,
+        "ev": -3.91,
+        "matchup": "Memphis Grizzlies @ Detroit Pistons",
+        "sport": "NBA",
+        "book": "DraftKings",
+    },
+    {
+        "team": "New York Knicks",
+        "odds": -800,
+        "sim_hit": 85.45,
+        "ev": -3.87,
+        "matchup": "Knicks @ Pacers",
+        "sport": "NBA",
+        "book": "FanDuel",
+    },
+    {
+        "team": "Boston Celtics",
+        "odds": -220,
+        "sim_hit": 72.10,
+        "ev": 3.25,
+        "matchup": "Boston Celtics @ Miami Heat",
+        "sport": "NBA",
+        "book": "DraftKings",
+    },
+    {
+        "team": "Denver Nuggets",
+        "odds": -145,
+        "sim_hit": 63.40,
+        "ev": 4.10,
+        "matchup": "Denver Nuggets @ Lakers",
+        "sport": "NBA",
+        "book": "FanDuel",
+    },
+    {
+        "team": "Sacramento Kings",
+        "odds": +120,
+        "sim_hit": 49.80,
+        "ev": 4.90,
+        "matchup": "Kings @ Suns",
+        "sport": "NBA",
+        "book": "DraftKings",
+    },
+    {
+        "team": "Minnesota Timberwolves",
+        "odds": +165,
+        "sim_hit": 43.00,
+        "ev": 6.75,
+        "matchup": "Timberwolves @ Thunder",
+        "sport": "NBA",
+        "book": "FanDuel",
+    },
+    {
+        "team": "Cleveland Cavaliers",
+        "odds": +210,
+        "sim_hit": 38.10,
+        "ev": 8.30,
+        "matchup": "Cavaliers @ Bucks",
+        "sport": "NBA",
+        "book": "DraftKings",
+    },
+    {
+        "team": "Seattle Kraken",
+        "odds": +145,
+        "sim_hit": 45.20,
+        "ev": 7.10,
+        "matchup": "Kraken @ Canucks",
+        "sport": "NHL",
+        "book": "FanDuel",
+    },
+    {
+        "team": "Texas Rangers",
+        "odds": -115,
+        "sim_hit": 57.60,
+        "ev": 3.40,
+        "matchup": "Rangers @ Astros",
+        "sport": "MLB",
+        "book": "DraftKings",
+    },
+]
 
-def american_to_decimal(a):
-    if a>0:
-        return 1+(a/100)
-    return 1+(100/abs(a))
-
-def decimal_to_american(d):
-    if d>=2:
-        return round((d-1)*100)
-    return round(-100/(d-1))
-
-def implied_prob(a):
-    if a>0:
-        return 100/(a+100)
-    return abs(a)/(abs(a)+100)
-
-def remove_vig(a,b):
-    p1=implied_prob(a)
-    p2=implied_prob(b)
-    s=p1+p2
-    return p1/s,p2/s
-
-def ev(win_prob,american):
-    dec=american_to_decimal(american)
-    profit=dec-1
-    return (win_prob*profit)-(1-win_prob)
-
-def now():
-    return datetime.now(timezone.utc)
-
-def parse(t):
-    return datetime.fromisoformat(t.replace("Z","+00:00"))
-
-def in_window(t):
-    try:
-        g=parse(t)
-    except:
-        return False
-    return now()<=g<=now()+timedelta(hours=WINDOW_HOURS)
-
-def fetch_games(book):
-    games=[]
-    for sport in SPORTS:
-
-        url=f"https://api.the-odds-api.com/v4/sports/{sport}/odds"
-
-        params={
-        "apiKey":ODDS_API_KEY,
-        "regions":"us",
-        "markets":"h2h",
-        "oddsFormat":"american",
-        "bookmakers":book
-        }
-
-        r=requests.get(url,params=params,timeout=20)
-        events=r.json()
-
-        for e in events:
-
-            if not in_window(e.get("commence_time","")):
-                continue
-
-            if not e.get("bookmakers"):
-                continue
-
-            m=None
-
-            for b in e["bookmakers"]:
-                for x in b["markets"]:
-                    if x["key"]=="h2h":
-                        m=x
-                        break
-                if m:
-                    break
-
-            if not m:
-                continue
-
-            if len(m["outcomes"])!=2:
-                continue
-
-            a=m["outcomes"][0]
-            b=m["outcomes"][1]
-
-            p1,p2=remove_vig(a["price"],b["price"])
-
-            games.append({
-            "sport":e.get("sport_title"),
-            "game":f"{e.get('away_team')} @ {e.get('home_team')}",
-            "time":e.get("commence_time"),
-            "book":book,
-            "legs":[
-            {"team":a["name"],"price":a["price"],"prob":p1},
-            {"team":b["name"],"price":b["price"],"prob":p2}
-            ]
-            })
-
-    return games
-
-
-def simulate(p,n):
-    w=0
-    for _ in range(n):
-        if random.random()<p:
-            w+=1
-    return w/n
-
-
-def single_score(hit,ev_val,price,mode):
-
-    if mode=="safe":
-        return (hit*0.75)+(ev_val*0.25)
-
-    if mode=="balanced":
-        return (hit*0.50)+(ev_val*0.50)
-
-    bonus=0
-    if price>0:
-        bonus=min(price/1000,0.25)
-
-    return (ev_val*0.60)+(hit*0.20)+bonus
-
-
-def find_singles(mode):
-
-    singles=[]
-
-    for book in BOOKMAKERS:
-
-        games=fetch_games(book)
-
-        for g in games:
-
-            for leg in g["legs"]:
-
-                prob=leg["prob"]
-
-                hit=simulate(prob,SIMULATION_COUNT)
-
-                if hit<SINGLE_THRESHOLDS[mode]:
-                    continue
-
-                if mode=="aggressive" and leg["price"]<AGGRESSIVE_MIN_PRICE:
-                    continue
-
-                e=ev(hit,leg["price"])
-
-                score=single_score(hit,e,leg["price"],mode)
-
-                singles.append({
-                "team":leg["team"],
-                "price":leg["price"],
-                "hit":hit,
-                "ev":e,
-                "score":score,
-                "game":g["game"],
-                "sport":g["sport"],
-                "book":book
-                })
-
-    singles.sort(key=lambda x:x["score"],reverse=True)
-
-    return singles[:TOP_N]
-
-
-HTML="""
-<html>
+HTML = """
+<!DOCTYPE html>
+<html lang="en">
 <head>
-<title>Parlay Forge</title>
-<style>
-body{background:#0b0b0e;color:white;font-family:Arial;padding:40px}
-.card{background:#1a1a20;padding:20px;border-radius:14px;margin-bottom:14px}
-.big{font-size:28px;font-weight:bold}
-.small{color:#aaa}
-button{padding:12px 20px;border-radius:10px;border:none;background:#ff7b00;color:black;font-weight:bold}
-select{padding:10px}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Parlay Forge</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            background: #06080d;
+            color: #f3f6fb;
+            font-family: Arial, sans-serif;
+        }
+        .wrap {
+            max-width: 1480px;
+            margin: 0 auto;
+            padding: 34px 36px 80px;
+        }
+        h1 {
+            margin: 0 0 18px;
+            font-size: 54px;
+            line-height: 1;
+        }
+        .sub {
+            margin: 0 0 24px;
+            color: #9fb0c5;
+            font-size: 15px;
+        }
+        form {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 24px;
+            flex-wrap: wrap;
+        }
+        select, button {
+            height: 50px;
+            border-radius: 10px;
+            border: none;
+            font-size: 18px;
+        }
+        select {
+            min-width: 180px;
+            padding: 0 14px;
+        }
+        button {
+            background: #ff9800;
+            color: #000;
+            font-weight: 800;
+            padding: 0 24px;
+            cursor: pointer;
+        }
+        .checkbox-wrap {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: #dbe4f0;
+            font-size: 15px;
+            padding: 0 8px;
+        }
+        .checkbox-wrap input {
+            transform: scale(1.15);
+        }
+        .status-bar {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin: 0 0 26px;
+        }
+        .pill {
+            background: #171c27;
+            color: #a9bbd1;
+            border: 1px solid #242c3c;
+            padding: 9px 14px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: .03em;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+            gap: 18px;
+        }
+        .card {
+            background: #151922;
+            border: 1px solid #232a38;
+            border-radius: 20px;
+            padding: 22px 22px 20px;
+            box-shadow: 0 10px 28px rgba(0,0,0,.18);
+        }
+        .topline {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+        .mode-tag {
+            display: inline-block;
+            background: #232a38;
+            color: #9fb0c5;
+            border-radius: 999px;
+            padding: 6px 10px;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+        }
+        .edge-tag {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 6px 10px;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+        }
+        .edge-elite { background: rgba(0, 200, 120, .18); color: #72f0aa; }
+        .edge-strong { background: rgba(100, 180, 255, .18); color: #85c7ff; }
+        .edge-ok { background: rgba(255, 180, 0, .18); color: #ffc861; }
+        .team {
+            font-size: 34px;
+            font-weight: 900;
+            line-height: 1.05;
+            margin: 0 0 8px;
+        }
+        .matchup {
+            color: #b8c5d6;
+            font-size: 16px;
+            margin-bottom: 12px;
+        }
+        .meta {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+            margin: 14px 0 18px;
+        }
+        .stat {
+            background: #0f131b;
+            border: 1px solid #222938;
+            border-radius: 14px;
+            padding: 12px 14px;
+        }
+        .label {
+            color: #8fa0b5;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            margin-bottom: 6px;
+        }
+        .value {
+            font-size: 22px;
+            font-weight: 800;
+        }
+        .ev-pos { color: #6bea9f; }
+        .ev-neg { color: #ff7e7e; }
+        .why {
+            background: #0f131b;
+            border: 1px solid #222938;
+            border-radius: 14px;
+            padding: 14px;
+        }
+        .why h3 {
+            margin: 0 0 10px;
+            font-size: 14px;
+            color: #9fb0c5;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+        }
+        .why ul {
+            margin: 0;
+            padding-left: 18px;
+            color: #dbe4f0;
+            line-height: 1.6;
+            font-size: 15px;
+        }
+        .empty {
+            color: #a9bbd1;
+            font-size: 18px;
+            margin-top: 20px;
+        }
+        .hint {
+            margin-top: 18px;
+            color: #8898ae;
+            font-size: 14px;
+        }
+    </style>
 </head>
 <body>
+    <div class="wrap">
+        <h1>Parlay Forge</h1>
+        <p class="sub">Mode-aware picks with EV filtering, market edge, and a quick reason why each bet made the cut.</p>
 
-<h1>Parlay Forge</h1>
+        <form method="GET" action="/">
+            <select name="mode">
+                <option value="safe" {% if mode == "safe" %}selected{% endif %}>Safe</option>
+                <option value="balanced" {% if mode == "balanced" %}selected{% endif %}>Balanced</option>
+                <option value="aggressive" {% if mode == "aggressive" %}selected{% endif %}>Aggressive</option>
+            </select>
 
-<form method="post">
+            <label class="checkbox-wrap">
+                <input type="checkbox" name="edge_only" value="1" {% if edge_only %}checked{% endif %}>
+                Edge only (EV > 0)
+            </label>
 
-<select name="mode">
-<option value="safe">Safe</option>
-<option value="balanced">Balanced</option>
-<option value="aggressive">Aggressive</option>
-</select>
+            <button type="submit">Forge</button>
+        </form>
 
-<button>Forge</button>
+        <div class="status-bar">
+            <div class="pill">Mode: {{ mode|capitalize }}</div>
+            <div class="pill">Edge Filter: {{ "On" if edge_only else "Off" }}</div>
+            <div class="pill">Results: {{ bets|length }}</div>
+        </div>
 
-</form>
+        {% if bets %}
+            <div class="grid">
+                {% for bet in bets %}
+                    <div class="card">
+                        <div class="topline">
+                            <span class="mode-tag">{{ mode|capitalize }}</span>
+                            <span class="edge-tag {{ bet.edge_class }}">{{ bet.edge_label }}</span>
+                        </div>
 
-{% if results %}
+                        <div class="team">{{ bet.team }}</div>
+                        <div class="matchup">{{ bet.matchup }} • {{ bet.sport }} • {{ bet.book }}</div>
 
-{% for r in results %}
+                        <div class="meta">
+                            <div class="stat">
+                                <div class="label">Odds</div>
+                                <div class="value">{{ bet.odds_display }}</div>
+                            </div>
+                            <div class="stat">
+                                <div class="label">Model Hit Rate</div>
+                                <div class="value">{{ "%.2f"|format(bet.sim_hit) }}%</div>
+                            </div>
+                            <div class="stat">
+                                <div class="label">Market Implied</div>
+                                <div class="value">{{ "%.2f"|format(bet.implied_prob) }}%</div>
+                            </div>
+                            <div class="stat">
+                                <div class="label">Model Edge</div>
+                                <div class="value {% if bet.edge >= 0 %}ev-pos{% else %}ev-neg{% endif %}">
+                                    {{ "%+.2f"|format(bet.edge) }}%
+                                </div>
+                            </div>
+                            <div class="stat">
+                                <div class="label">EV</div>
+                                <div class="value {% if bet.ev >= 0 %}ev-pos{% else %}ev-neg{% endif %}">
+                                    {{ "%+.2f"|format(bet.ev) }}%
+                                </div>
+                            </div>
+                            <div class="stat">
+                                <div class="label">Confidence</div>
+                                <div class="value">{{ bet.confidence }}</div>
+                            </div>
+                        </div>
 
-<div class="card">
+                        <div class="why">
+                            <h3>Why this bet made the board</h3>
+                            <ul>
+                                {% for line in bet.reasons %}
+                                    <li>{{ line }}</li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                    </div>
+                {% endfor %}
+            </div>
+        {% else %}
+            <div class="empty">
+                No bets matched this mode/filter combo.
+            </div>
+        {% endif %}
 
-<div class="big">{{r.team}} ({{r.price}})</div>
-
-<div>Sim hit: {{'%0.2f'%(r.hit*100)}}%</div>
-<div>EV: {{'%0.2f'%(r.ev*100)}}%</div>
-
-<div class="small">{{r.game}}</div>
-<div class="small">{{r.sport}}</div>
-<div class="small">{{r.book}}</div>
-
-</div>
-
-{% endfor %}
-
-{% endif %}
-
+        <div class="hint">
+            Safe = heavy favorites. Balanced = tighter prices. Aggressive = plus-money / bigger swings.
+        </div>
+    </div>
 </body>
 </html>
 """
 
-@app.route("/",methods=["GET","POST"])
+def american_to_implied_prob(odds: int) -> float:
+    """Convert American odds to implied probability percentage."""
+    if odds < 0:
+        return (abs(odds) / (abs(odds) + 100)) * 100
+    return (100 / (odds + 100)) * 100
+
+
+def format_american_odds(odds: int) -> str:
+    return f"+{odds}" if odds > 0 else str(odds)
+
+
+def confidence_label(sim_hit: float) -> str:
+    if sim_hit >= 75:
+        return "Very High"
+    if sim_hit >= 62:
+        return "High"
+    if sim_hit >= 50:
+        return "Moderate"
+    return "Volatile"
+
+
+def edge_label(edge: float) -> tuple[str, str]:
+    if edge >= 7:
+        return "Elite Edge", "edge-elite"
+    if edge >= 4:
+        return "Strong Edge", "edge-strong"
+    return "Playable", "edge-ok"
+
+
+def mode_filter(mode: str, odds: int) -> bool:
+    """
+    Safe: mostly favorites
+    Balanced: modest favorites through slight dogs
+    Aggressive: plus money / larger upside
+    """
+    if mode == "safe":
+        return odds <= -180
+    if mode == "balanced":
+        return -179 <= odds <= 140
+    if mode == "aggressive":
+        return odds >= 100
+    return True
+
+
+def build_reasons(bet: Dict[str, Any]) -> List[str]:
+    reasons: List[str] = []
+
+    if bet["edge"] >= 7:
+        reasons.append("Model is significantly higher than the market price.")
+    elif bet["edge"] >= 4:
+        reasons.append("Model shows a meaningful edge over the market.")
+    else:
+        reasons.append("Model has this side slightly above market.")
+
+    if bet["ev"] > 0:
+        reasons.append("Expected value is positive, so it passes the edge filter.")
+    else:
+        reasons.append("Expected value is negative, so this is more of a confidence play than a value play.")
+
+    if bet["odds"] <= -180:
+        reasons.append("Price profile fits a safer parlay leg or anchor.")
+    elif -179 <= bet["odds"] <= 140:
+        reasons.append("Price profile fits a balanced single or mid-risk parlay piece.")
+    else:
+        reasons.append("Price profile fits an aggressive play with higher upside.")
+
+    return reasons
+
+
+def enrich_bet(bet: Dict[str, Any]) -> Dict[str, Any]:
+    implied_prob = american_to_implied_prob(bet["odds"])
+    edge = bet["sim_hit"] - implied_prob
+    label, css = edge_label(edge)
+
+    enriched = dict(bet)
+    enriched["implied_prob"] = implied_prob
+    enriched["edge"] = edge
+    enriched["edge_label"] = label
+    enriched["edge_class"] = css
+    enriched["odds_display"] = format_american_odds(bet["odds"])
+    enriched["confidence"] = confidence_label(bet["sim_hit"])
+    enriched["reasons"] = build_reasons(
+        {
+            **bet,
+            "implied_prob": implied_prob,
+            "edge": edge,
+        }
+    )
+    return enriched
+
+
+@app.route("/", methods=["GET"])
 def home():
+    mode = request.args.get("mode", "safe").strip().lower()
+    edge_only = request.args.get("edge_only") == "1"
 
-    results=None
+    valid_modes = {"safe", "balanced", "aggressive"}
+    if mode not in valid_modes:
+        mode = "safe"
 
-    mode="safe"
+    filtered: List[Dict[str, Any]] = []
+    for bet in BETS:
+        if not mode_filter(mode, bet["odds"]):
+            continue
 
-    if request.method=="POST":
-        mode=request.form.get("mode","safe")
-        results=find_singles(mode)
+        enriched = enrich_bet(bet)
 
-    return render_template_string(HTML,results=results)
+        if edge_only and enriched["ev"] <= 0:
+            continue
+
+        filtered.append(enriched)
+
+    # Best bets first: strongest EV, then edge
+    filtered.sort(key=lambda x: (x["ev"], x["edge"]), reverse=True)
+
+    return render_template_string(
+        HTML,
+        bets=filtered,
+        mode=mode,
+        edge_only=edge_only,
+    )
 
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=PORT,debug=False)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000, debug=True)
