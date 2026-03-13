@@ -69,6 +69,8 @@ MODE_CONFIG = {
 WINDOW_HOURS = 48
 TOP_N = 5
 MAX_SINGLE_LEG_FAVORITE = -600
+SAFE_SINGLE_MIN_HIT = 0.70
+
 app = Flask(__name__)
 
 
@@ -272,7 +274,15 @@ def adjust_probability(game, leg, mode_key):
     return max(0.01, min(0.99, prob))
 
 
-def simulate(prob_a, prob_b, n):
+def simulate_single(prob, n):
+    wins = 0
+    for _ in range(n):
+        if random.random() < prob:
+            wins += 1
+    return wins / n
+
+
+def simulate_parlay(prob_a, prob_b, n):
     wins = 0
     for _ in range(n):
         if random.random() < prob_a and random.random() < prob_b:
@@ -289,7 +299,7 @@ def price_fit_score(odds, mode_key):
     return max(0.0, 1 - abs(odds - midpoint) / span)
 
 
-def rating_label(ev, edge):
+def parlay_rating_label(ev, edge):
     if ev >= 0.03 and edge >= 0.02:
         return "Playable"
     if ev >= 0.0:
@@ -299,6 +309,73 @@ def rating_label(ev, edge):
     if ev >= -0.10:
         return "Risky"
     return "Bad Price"
+
+
+def single_rating_label(hit, ev):
+    if hit >= 0.80 and ev >= 0:
+        return "Hammer Safe"
+    if hit >= 0.75:
+        return "Very Safe"
+    if hit >= 0.70:
+        return "Safe"
+    return "Not Safe"
+
+
+def find_safe_singles(mode_key):
+    singles = []
+    market_counts = []
+
+    for book in BOOKMAKERS:
+        games = fetch_games(book)
+        local_count = 0
+
+        for game in games:
+            for leg in game["legs"]:
+                if leg["price"] < MAX_SINGLE_LEG_FAVORITE:
+                    continue
+
+                adj_prob = adjust_probability(game, leg, mode_key)
+                sim_hit = simulate_single(adj_prob, SIMULATION_COUNT)
+
+                if sim_hit < SAFE_SINGLE_MIN_HIT:
+                    continue
+
+                break_even = break_even_prob(leg["price"])
+                edge = sim_hit - break_even
+                ev = ev_per_dollar(sim_hit, leg["price"])
+
+                score = (sim_hit * 0.72) + (ev * 0.20) + (edge * 0.08)
+
+                local_count += 1
+                singles.append(
+                    {
+                        "book": game["book"],
+                        "team": leg["team"],
+                        "price": leg["price"],
+                        "price_display": format_american(leg["price"]),
+                        "hit": sim_hit,
+                        "ev": ev,
+                        "edge": edge,
+                        "score": score,
+                        "rating": single_rating_label(sim_hit, ev),
+                        "sport": game["sport"],
+                        "game": game["game"],
+                        "time": game["display_time"],
+                        "raw_prob": leg["prob"],
+                        "adj_prob": adj_prob,
+                    }
+                )
+
+        market_counts.append(
+            {
+                "book": BOOKMAKERS[book],
+                "games": len(games),
+                "candidates": local_count,
+            }
+        )
+
+    singles.sort(key=lambda x: (x["score"], x["hit"], x["ev"], x["edge"]), reverse=True)
+    return singles[:TOP_N], market_counts
 
 
 def find_parlays(mode_key):
@@ -323,7 +400,7 @@ def find_parlays(mode_key):
 
                     p1 = adjust_probability(g1, l1, mode_key)
                     p2 = adjust_probability(g2, l2, mode_key)
-                    sim_hit = simulate(p1, p2, SIMULATION_COUNT)
+                    sim_hit = simulate_parlay(p1, p2, SIMULATION_COUNT)
                     baseline_hit = p1 * p2
                     break_even = break_even_prob(odds)
                     edge = sim_hit - break_even
@@ -371,7 +448,7 @@ def find_parlays(mode_key):
                             "ev": ev,
                             "line_value": line_value,
                             "score": score,
-                            "rating": rating_label(ev, edge),
+                            "rating": parlay_rating_label(ev, edge),
                         }
                     )
 
@@ -393,7 +470,7 @@ HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Parlay Forge V7</title>
+  <title>Parlay Forge V8</title>
   <style>
     :root {
       --bg: #08080b;
@@ -546,51 +623,73 @@ HTML = """
 <body>
   <div class="wrap">
     <div class="hero">
-      <div class="eyebrow">Forge Mode // V7</div>
+      <div class="eyebrow">Forge Mode // V8</div>
       <h1>Parlay Forge</h1>
-      <p class="sub">Always shows the top 5 available parlays. No strict hiding. You still get odds, sim hit rate, EV, and edge, but each parlay is labeled so you can see whether it looks playable, thin, risky, or like a bad price.</p>
+      <p class="sub">Safe Singles only returns bets with at least 70% simulated hit rate. Parlay Scanner keeps the ranked 2-leg parlay view. This is much closer to what you meant by safe.</p>
       <form method="post" class="controls">
+        <select name="bet_type">
+          <option value="singles" {% if bet_type == 'singles' %}selected{% endif %}>Safe Singles</option>
+          <option value="parlays" {% if bet_type == 'parlays' %}selected{% endif %}>Parlay Scanner</option>
+        </select>
         <select name="mode">
           <option value="safe" {% if mode == 'safe' %}selected{% endif %}>Safe</option>
           <option value="balanced" {% if mode == 'balanced' %}selected{% endif %}>Balanced</option>
           <option value="aggressive" {% if mode == 'aggressive' %}selected{% endif %}>Aggressive</option>
         </select>
-        <button type="submit">Forge V7 Parlays</button>
+        <button type="submit">Forge V8</button>
       </form>
       {% if results is not none %}
-        <div class="meta">Mode: {{ mode_label }} · Window: {{ window_hours }} hours · Simulations per candidate: {{ sim_count }} · Top results shown: {{ top_n }}</div>
+        <div class="meta">Bet type: {{ bet_type_label }} · Mode: {{ mode_label }} · Window: {{ window_hours }} hours · Simulations: {{ sim_count }} · Top shown: {{ top_n }}</div>
       {% endif %}
     </div>
 
     {% if results %}
       <div class="grid">
-        {% for p in results %}
+        {% for item in results %}
           <div class="card">
             <div class="rankrow">
               <div class="rank">Rank {{ loop.index }}</div>
-              <div class="rating">{{ p.rating }}</div>
-            </div>
-            <div class="odds">{{ p.odds_display }}</div>
-            <div>
-              <span class="metric">Book: {{ p.book }}</span>
-              <span class="metric">Sim hit: {{ '%.2f'|format(p.hit*100) }}%</span>
-              <span class="metric">EV: {{ '%.2f'|format(p.ev*100) }}%</span>
-              <span class="metric">Edge: {{ '%.2f'|format(p.edge*100) }}%</span>
+              <div class="rating">{{ item.rating }}</div>
             </div>
 
-            <div class="leg">
-              <div class="team">{{ p.leg1.team }} ({{ p.leg1.price_display }})</div>
-              <div class="small">{{ p.leg1.game }}</div>
-              <div class="small">{{ p.leg1.sport }} · {{ p.leg1.time }}</div>
-              <div class="small">Adj win rate: {{ '%.2f'|format(p.leg1.prob*100) }}% · Raw: {{ '%.2f'|format(p.leg1.raw_prob*100) }}%</div>
-            </div>
+            {% if bet_type == 'singles' %}
+              <div class="odds">{{ item.price_display }}</div>
+              <div>
+                <span class="metric">Book: {{ item.book }}</span>
+                <span class="metric">Sim hit: {{ '%.2f'|format(item.hit*100) }}%</span>
+                <span class="metric">EV: {{ '%.2f'|format(item.ev*100) }}%</span>
+                <span class="metric">Edge: {{ '%.2f'|format(item.edge*100) }}%</span>
+              </div>
 
-            <div class="leg">
-              <div class="team">{{ p.leg2.team }} ({{ p.leg2.price_display }})</div>
-              <div class="small">{{ p.leg2.game }}</div>
-              <div class="small">{{ p.leg2.sport }} · {{ p.leg2.time }}</div>
-              <div class="small">Adj win rate: {{ '%.2f'|format(p.leg2.prob*100) }}% · Raw: {{ '%.2f'|format(p.leg2.raw_prob*100) }}%</div>
-            </div>
+              <div class="leg">
+                <div class="team">{{ item.team }} ({{ item.price_display }})</div>
+                <div class="small">{{ item.game }}</div>
+                <div class="small">{{ item.sport }} · {{ item.time }}</div>
+                <div class="small">Adj win rate: {{ '%.2f'|format(item.adj_prob*100) }}% · Raw: {{ '%.2f'|format(item.raw_prob*100) }}%</div>
+              </div>
+            {% else %}
+              <div class="odds">{{ item.odds_display }}</div>
+              <div>
+                <span class="metric">Book: {{ item.book }}</span>
+                <span class="metric">Sim hit: {{ '%.2f'|format(item.hit*100) }}%</span>
+                <span class="metric">EV: {{ '%.2f'|format(item.ev*100) }}%</span>
+                <span class="metric">Edge: {{ '%.2f'|format(item.edge*100) }}%</span>
+              </div>
+
+              <div class="leg">
+                <div class="team">{{ item.leg1.team }} ({{ item.leg1.price_display }})</div>
+                <div class="small">{{ item.leg1.game }}</div>
+                <div class="small">{{ item.leg1.sport }} · {{ item.leg1.time }}</div>
+                <div class="small">Adj win rate: {{ '%.2f'|format(item.leg1.prob*100) }}% · Raw: {{ '%.2f'|format(item.leg1.raw_prob*100) }}%</div>
+              </div>
+
+              <div class="leg">
+                <div class="team">{{ item.leg2.team }} ({{ item.leg2.price_display }})</div>
+                <div class="small">{{ item.leg2.game }}</div>
+                <div class="small">{{ item.leg2.sport }} · {{ item.leg2.time }}</div>
+                <div class="small">Adj win rate: {{ '%.2f'|format(item.leg2.prob*100) }}% · Raw: {{ '%.2f'|format(item.leg2.raw_prob*100) }}%</div>
+              </div>
+            {% endif %}
           </div>
         {% endfor %}
       </div>
@@ -620,19 +719,28 @@ HTML = """
 def home():
     results = None
     market_counts = None
-    mode = request.form.get("mode", "balanced") if request.method == "POST" else "balanced"
+    mode = request.form.get("mode", "safe") if request.method == "POST" else "safe"
+    bet_type = request.form.get("bet_type", "singles") if request.method == "POST" else "singles"
+
     if mode not in MODE_CONFIG:
-        mode = "balanced"
+        mode = "safe"
+    if bet_type not in {"singles", "parlays"}:
+        bet_type = "singles"
 
     if request.method == "POST":
-        results, market_counts = find_parlays(mode)
+        if bet_type == "singles":
+            results, market_counts = find_safe_singles(mode)
+        else:
+            results, market_counts = find_parlays(mode)
 
     return render_template_string(
         HTML,
         results=results,
         market_counts=market_counts,
         mode=mode,
+        bet_type=bet_type,
         mode_label=MODE_CONFIG[mode]["label"],
+        bet_type_label="Safe Singles" if bet_type == "singles" else "Parlay Scanner",
         sim_count=f"{SIMULATION_COUNT:,}",
         top_n=TOP_N,
         window_hours=WINDOW_HOURS,
