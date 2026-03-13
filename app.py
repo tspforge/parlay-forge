@@ -1,11 +1,13 @@
 from flask import Flask, request, render_template_string
 from typing import List, Dict, Any
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
 # -------------------------------------------------------------------
 # SAMPLE DATA
 # Replace this later with your real odds/model feed.
+# IMPORTANT: game_time must be in ISO format: YYYY-MM-DDTHH:MM:SS
 # -------------------------------------------------------------------
 BETS: List[Dict[str, Any]] = [
     {
@@ -16,6 +18,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Memphis Grizzlies @ Detroit Pistons",
         "sport": "NBA",
         "book": "FanDuel",
+        "game_time": "2026-03-13T19:00:00",
     },
     {
         "team": "Detroit Pistons",
@@ -25,15 +28,17 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Memphis Grizzlies @ Detroit Pistons",
         "sport": "NBA",
         "book": "DraftKings",
+        "game_time": "2026-03-13T19:00:00",
     },
     {
         "team": "New York Knicks",
         "odds": -800,
         "sim_hit": 85.45,
         "ev": -3.87,
-        "matchup": "Knicks @ Pacers",
+        "matchup": "New York Knicks @ Indiana Pacers",
         "sport": "NBA",
         "book": "FanDuel",
+        "game_time": "2026-03-13T20:00:00",
     },
     {
         "team": "Boston Celtics",
@@ -43,6 +48,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Boston Celtics @ Miami Heat",
         "sport": "NBA",
         "book": "DraftKings",
+        "game_time": "2026-03-20T19:30:00",  # outside next 24h on purpose
     },
     {
         "team": "Denver Nuggets",
@@ -52,6 +58,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Denver Nuggets @ Lakers",
         "sport": "NBA",
         "book": "FanDuel",
+        "game_time": "2026-03-13T22:00:00",
     },
     {
         "team": "Sacramento Kings",
@@ -61,6 +68,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Kings @ Suns",
         "sport": "NBA",
         "book": "DraftKings",
+        "game_time": "2026-03-13T21:30:00",
     },
     {
         "team": "Minnesota Timberwolves",
@@ -70,6 +78,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Timberwolves @ Thunder",
         "sport": "NBA",
         "book": "FanDuel",
+        "game_time": "2026-03-13T20:30:00",
     },
     {
         "team": "Cleveland Cavaliers",
@@ -79,6 +88,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Cavaliers @ Bucks",
         "sport": "NBA",
         "book": "DraftKings",
+        "game_time": "2026-03-13T19:30:00",
     },
     {
         "team": "Seattle Kraken",
@@ -88,6 +98,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Kraken @ Canucks",
         "sport": "NHL",
         "book": "FanDuel",
+        "game_time": "2026-03-13T22:30:00",
     },
     {
         "team": "Texas Rangers",
@@ -97,6 +108,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Rangers @ Astros",
         "sport": "MLB",
         "book": "DraftKings",
+        "game_time": "2026-03-13T18:45:00",
     },
 ]
 
@@ -223,6 +235,7 @@ HTML = """
         .edge-elite { background: rgba(0, 200, 120, .18); color: #72f0aa; }
         .edge-strong { background: rgba(100, 180, 255, .18); color: #85c7ff; }
         .edge-ok { background: rgba(255, 180, 0, .18); color: #ffc861; }
+
         .team {
             font-size: 34px;
             font-weight: 900;
@@ -232,6 +245,11 @@ HTML = """
         .matchup {
             color: #b8c5d6;
             font-size: 16px;
+            margin-bottom: 6px;
+        }
+        .gametime {
+            color: #8fa0b5;
+            font-size: 14px;
             margin-bottom: 12px;
         }
         .meta {
@@ -260,6 +278,7 @@ HTML = """
         }
         .ev-pos { color: #6bea9f; }
         .ev-neg { color: #ff7e7e; }
+
         .why {
             background: #0f131b;
             border: 1px solid #222938;
@@ -295,7 +314,7 @@ HTML = """
 <body>
     <div class="wrap">
         <h1>Parlay Forge</h1>
-        <p class="sub">Mode-aware picks with EV filtering, market edge, and a quick reason why each bet made the cut.</p>
+        <p class="sub">Mode-aware picks with EV filtering, market edge, and a quick reason why each bet made the board.</p>
 
         <form method="GET" action="/">
             <select name="mode">
@@ -329,6 +348,7 @@ HTML = """
 
                         <div class="team">{{ bet.team }}</div>
                         <div class="matchup">{{ bet.matchup }} • {{ bet.sport }} • {{ bet.book }}</div>
+                        <div class="gametime">Starts: {{ bet.game_time_display }}</div>
 
                         <div class="meta">
                             <div class="stat">
@@ -374,7 +394,7 @@ HTML = """
             </div>
         {% else %}
             <div class="empty">
-                No bets matched this mode/filter combo.
+                No bets matched this mode/filter combo in the next 24 hours.
             </div>
         {% endif %}
 
@@ -385,6 +405,7 @@ HTML = """
 </body>
 </html>
 """
+
 
 def american_to_implied_prob(odds: int) -> float:
     """Convert American odds to implied probability percentage."""
@@ -430,6 +451,25 @@ def mode_filter(mode: str, odds: int) -> bool:
     return True
 
 
+def is_within_next_24h(game_time_str: str) -> bool:
+    """Return True if game starts within the next 24 hours."""
+    try:
+        game_time = datetime.fromisoformat(game_time_str)
+        now = datetime.now()
+        cutoff = now + timedelta(hours=24)
+        return now <= game_time <= cutoff
+    except Exception:
+        return False
+
+
+def format_game_time(game_time_str: str) -> str:
+    try:
+        dt = datetime.fromisoformat(game_time_str)
+        return dt.strftime("%b %d, %I:%M %p")
+    except Exception:
+        return game_time_str
+
+
 def build_reasons(bet: Dict[str, Any]) -> List[str]:
     reasons: List[str] = []
 
@@ -467,6 +507,7 @@ def enrich_bet(bet: Dict[str, Any]) -> Dict[str, Any]:
     enriched["edge_class"] = css
     enriched["odds_display"] = format_american_odds(bet["odds"])
     enriched["confidence"] = confidence_label(bet["sim_hit"])
+    enriched["game_time_display"] = format_game_time(bet["game_time"])
     enriched["reasons"] = build_reasons(
         {
             **bet,
@@ -487,18 +528,25 @@ def home():
         mode = "safe"
 
     filtered: List[Dict[str, Any]] = []
+
     for bet in BETS:
+        # Only games in next 24 hours
+        if not is_within_next_24h(bet["game_time"]):
+            continue
+
+        # Mode filter
         if not mode_filter(mode, bet["odds"]):
             continue
 
         enriched = enrich_bet(bet)
 
+        # Positive EV only if requested
         if edge_only and enriched["ev"] <= 0:
             continue
 
         filtered.append(enriched)
 
-    # Best bets first: strongest EV, then edge
+    # Best bets first
     filtered.sort(key=lambda x: (x["ev"], x["edge"]), reverse=True)
 
     return render_template_string(
