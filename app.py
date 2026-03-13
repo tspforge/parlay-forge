@@ -1,13 +1,22 @@
 from flask import Flask, request, render_template_string
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
+
+LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 
 # -------------------------------------------------------------------
 # SAMPLE DATA
 # Replace this later with your real odds/model feed.
-# IMPORTANT: game_time must be in ISO format: YYYY-MM-DDTHH:MM:SS
+# IMPORTANT:
+# - game_time must be ISO format
+# - if no timezone offset is included, this app assumes UTC
+# Examples:
+#   "2026-03-13T19:00:00Z"
+#   "2026-03-13T19:00:00+00:00"
+#   "2026-03-13T19:00:00"   <-- treated as UTC by this app
 # -------------------------------------------------------------------
 BETS: List[Dict[str, Any]] = [
     {
@@ -18,7 +27,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Memphis Grizzlies @ Detroit Pistons",
         "sport": "NBA",
         "book": "FanDuel",
-        "game_time": "2026-03-13T19:00:00",
+        "game_time": "2026-03-13T19:00:00Z",
     },
     {
         "team": "Detroit Pistons",
@@ -28,7 +37,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Memphis Grizzlies @ Detroit Pistons",
         "sport": "NBA",
         "book": "DraftKings",
-        "game_time": "2026-03-13T19:00:00",
+        "game_time": "2026-03-13T19:00:00Z",
     },
     {
         "team": "New York Knicks",
@@ -38,7 +47,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "New York Knicks @ Indiana Pacers",
         "sport": "NBA",
         "book": "FanDuel",
-        "game_time": "2026-03-13T20:00:00",
+        "game_time": "2026-03-13T20:00:00Z",
     },
     {
         "team": "Boston Celtics",
@@ -48,7 +57,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Boston Celtics @ Miami Heat",
         "sport": "NBA",
         "book": "DraftKings",
-        "game_time": "2026-03-20T19:30:00",  # outside next 24h on purpose
+        "game_time": "2026-03-20T19:30:00Z",
     },
     {
         "team": "Denver Nuggets",
@@ -58,7 +67,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Denver Nuggets @ Lakers",
         "sport": "NBA",
         "book": "FanDuel",
-        "game_time": "2026-03-13T22:00:00",
+        "game_time": "2026-03-13T22:00:00Z",
     },
     {
         "team": "Sacramento Kings",
@@ -68,7 +77,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Kings @ Suns",
         "sport": "NBA",
         "book": "DraftKings",
-        "game_time": "2026-03-13T21:30:00",
+        "game_time": "2026-03-13T21:30:00Z",
     },
     {
         "team": "Minnesota Timberwolves",
@@ -78,7 +87,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Timberwolves @ Thunder",
         "sport": "NBA",
         "book": "FanDuel",
-        "game_time": "2026-03-13T20:30:00",
+        "game_time": "2026-03-13T20:30:00Z",
     },
     {
         "team": "Cleveland Cavaliers",
@@ -88,7 +97,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Cavaliers @ Bucks",
         "sport": "NBA",
         "book": "DraftKings",
-        "game_time": "2026-03-13T19:30:00",
+        "game_time": "2026-03-13T19:30:00Z",
     },
     {
         "team": "Seattle Kraken",
@@ -98,7 +107,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Kraken @ Canucks",
         "sport": "NHL",
         "book": "FanDuel",
-        "game_time": "2026-03-13T22:30:00",
+        "game_time": "2026-03-13T22:30:00Z",
     },
     {
         "team": "Texas Rangers",
@@ -108,7 +117,7 @@ BETS: List[Dict[str, Any]] = [
         "matchup": "Rangers @ Astros",
         "sport": "MLB",
         "book": "DraftKings",
-        "game_time": "2026-03-13T18:45:00",
+        "game_time": "2026-03-13T18:45:00Z",
     },
 ]
 
@@ -314,7 +323,7 @@ HTML = """
 <body>
     <div class="wrap">
         <h1>Parlay Forge</h1>
-        <p class="sub">Mode-aware picks with EV filtering, market edge, and a quick reason why each bet made the board.</p>
+        <p class="sub">Mode-aware picks with EV filtering, market edge, and only games starting in the next 24 hours (Pacific time).</p>
 
         <form method="GET" action="/">
             <select name="mode">
@@ -334,6 +343,7 @@ HTML = """
         <div class="status-bar">
             <div class="pill">Mode: {{ mode|capitalize }}</div>
             <div class="pill">Edge Filter: {{ "On" if edge_only else "Off" }}</div>
+            <div class="pill">Now (PT): {{ now_display }}</div>
             <div class="pill">Results: {{ bets|length }}</div>
         </div>
 
@@ -406,9 +416,7 @@ HTML = """
 </html>
 """
 
-
 def american_to_implied_prob(odds: int) -> float:
-    """Convert American odds to implied probability percentage."""
     if odds < 0:
         return (abs(odds) / (abs(odds) + 100)) * 100
     return (100 / (odds + 100)) * 100
@@ -437,11 +445,6 @@ def edge_label(edge: float) -> tuple[str, str]:
 
 
 def mode_filter(mode: str, odds: int) -> bool:
-    """
-    Safe: mostly favorites
-    Balanced: modest favorites through slight dogs
-    Aggressive: plus money / larger upside
-    """
     if mode == "safe":
         return odds <= -180
     if mode == "balanced":
@@ -451,23 +454,30 @@ def mode_filter(mode: str, odds: int) -> bool:
     return True
 
 
+def parse_game_time_to_local(game_time_str: str) -> datetime:
+    """
+    Parse ISO string and convert to Pacific time.
+    If timezone is missing, assume UTC.
+    """
+    s = game_time_str.strip().replace("Z", "+00:00")
+    dt = datetime.fromisoformat(s)
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+
+    return dt.astimezone(LOCAL_TZ)
+
+
 def is_within_next_24h(game_time_str: str) -> bool:
-    """Return True if game starts within the next 24 hours."""
-    try:
-        game_time = datetime.fromisoformat(game_time_str)
-        now = datetime.now()
-        cutoff = now + timedelta(hours=24)
-        return now <= game_time <= cutoff
-    except Exception:
-        return False
+    game_local = parse_game_time_to_local(game_time_str)
+    now_local = datetime.now(LOCAL_TZ)
+    cutoff = now_local + timedelta(hours=24)
+    return now_local <= game_local <= cutoff
 
 
 def format_game_time(game_time_str: str) -> str:
-    try:
-        dt = datetime.fromisoformat(game_time_str)
-        return dt.strftime("%b %d, %I:%M %p")
-    except Exception:
-        return game_time_str
+    dt = parse_game_time_to_local(game_time_str)
+    return dt.strftime("%b %d, %I:%M %p PT")
 
 
 def build_reasons(bet: Dict[str, Any]) -> List[str]:
@@ -508,6 +518,7 @@ def enrich_bet(bet: Dict[str, Any]) -> Dict[str, Any]:
     enriched["odds_display"] = format_american_odds(bet["odds"])
     enriched["confidence"] = confidence_label(bet["sim_hit"])
     enriched["game_time_display"] = format_game_time(bet["game_time"])
+    enriched["game_time_local_dt"] = parse_game_time_to_local(bet["game_time"])
     enriched["reasons"] = build_reasons(
         {
             **bet,
@@ -530,30 +541,31 @@ def home():
     filtered: List[Dict[str, Any]] = []
 
     for bet in BETS:
-        # Only games in next 24 hours
         if not is_within_next_24h(bet["game_time"]):
             continue
 
-        # Mode filter
         if not mode_filter(mode, bet["odds"]):
             continue
 
         enriched = enrich_bet(bet)
 
-        # Positive EV only if requested
         if edge_only and enriched["ev"] <= 0:
             continue
 
         filtered.append(enriched)
 
-    # Best bets first
-    filtered.sort(key=lambda x: (x["ev"], x["edge"]), reverse=True)
+    filtered.sort(
+        key=lambda x: (x["game_time_local_dt"], -x["ev"], -x["edge"])
+    )
+
+    now_local = datetime.now(LOCAL_TZ)
 
     return render_template_string(
         HTML,
         bets=filtered,
         mode=mode,
         edge_only=edge_only,
+        now_display=now_local.strftime("%b %d, %I:%M %p"),
     )
 
 
