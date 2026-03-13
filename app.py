@@ -31,54 +31,44 @@ MODE_CONFIG = {
     "safe": {
         "label": "Safe",
         "min_odds": 120,
-        "max_odds": 220,
-        "chalk_penalty": 0.05,
-        "dog_penalty": 0.07,
-        "volatility_weight": 0.06,
-        "score_hit": 0.70,
-        "score_ev": 0.22,
+        "max_odds": 260,
+        "chalk_penalty": 0.045,
+        "dog_penalty": 0.070,
+        "volatility_weight": 0.060,
+        "score_hit": 0.68,
+        "score_ev": 0.16,
         "score_line": 0.08,
+        "score_price": 0.08,
     },
     "balanced": {
         "label": "Balanced",
-        "min_odds": 180,
-        "max_odds": 350,
-        "chalk_penalty": 0.04,
-        "dog_penalty": 0.06,
-        "volatility_weight": 0.08,
-        "score_hit": 0.58,
-        "score_ev": 0.28,
-        "score_line": 0.14,
+        "min_odds": 160,
+        "max_odds": 420,
+        "chalk_penalty": 0.040,
+        "dog_penalty": 0.060,
+        "volatility_weight": 0.080,
+        "score_hit": 0.55,
+        "score_ev": 0.20,
+        "score_line": 0.12,
+        "score_price": 0.13,
     },
     "aggressive": {
         "label": "Aggressive",
-        "min_odds": 300,
-        "max_odds": 650,
-        "chalk_penalty": 0.03,
-        "dog_penalty": 0.05,
-        "volatility_weight": 0.10,
-        "score_hit": 0.48,
-        "score_ev": 0.32,
-        "score_line": 0.20,
+        "min_odds": 220,
+        "max_odds": 800,
+        "chalk_penalty": 0.032,
+        "dog_penalty": 0.050,
+        "volatility_weight": 0.100,
+        "score_hit": 0.42,
+        "score_ev": 0.20,
+        "score_line": 0.15,
+        "score_price": 0.23,
     },
 }
 
-ENGINE_CONFIG = {
-    "strict": {
-        "label": "Strict",
-        "min_ev": 0.0,
-        "description": "Only positive-EV parlays. No forcing action.",
-    },
-    "action": {
-        "label": "Action",
-        "min_ev": -0.05,
-        "description": "Best available parlays, even if slightly negative EV.",
-    },
-}
-
-WINDOW_HOURS = 24
+WINDOW_HOURS = 48
 TOP_N = 5
-MAX_SINGLE_LEG_FAVORITE = -350
+MAX_SINGLE_LEG_FAVORITE = -600
 app = Flask(__name__)
 
 
@@ -208,8 +198,6 @@ def fetch_games(book):
                     "game": f"{event.get('away_team')} @ {event.get('home_team')}",
                     "time": commence,
                     "display_time": format_time(commence),
-                    "home_team": event.get("home_team"),
-                    "away_team": event.get("away_team"),
                     "book": BOOKMAKERS[book],
                     "legs": [
                         {"team": a["name"], "price": a["price"], "prob": p1},
@@ -235,9 +223,8 @@ def sport_volatility(sport):
 
 def infer_injury_risk(game, leg):
     risk = 0.0
-    if game["sport"] == "American Football":
-        if abs(leg["price"]) < 130:
-            risk += 0.006
+    if game["sport"] == "American Football" and abs(leg["price"]) < 130:
+        risk += 0.006
     elif game["sport"] == "Baseball":
         risk += 0.008
     elif game["sport"] == "Mixed Martial Arts":
@@ -255,10 +242,9 @@ def infer_public_side_penalty(leg):
 
 
 def infer_qb_or_pitcher_penalty(game):
-    sport = game["sport"]
-    if sport == "American Football":
+    if game["sport"] == "American Football":
         return 0.010
-    if sport == "Baseball":
+    if game["sport"] == "Baseball":
         return 0.015
     return 0.0
 
@@ -294,18 +280,29 @@ def simulate(prob_a, prob_b, n):
     return wins / n
 
 
-def parlay_confidence(rank_idx, mode_key):
-    names = {
-        "safe": ["Iron Lock", "Strong", "Steady", "Measured", "Thin Edge"],
-        "balanced": ["Prime", "Strong", "Balanced", "Press", "Thin Edge"],
-        "aggressive": ["Heat Check", "Live Dog", "Swing", "Spicy", "Longshot"],
-    }
-    return names[mode_key][rank_idx]
-
-
-def find_parlays(mode_key, engine_key):
+def price_fit_score(odds, mode_key):
     mode = MODE_CONFIG[mode_key]
-    engine = ENGINE_CONFIG[engine_key]
+    min_odds = mode["min_odds"]
+    max_odds = mode["max_odds"]
+    midpoint = (min_odds + max_odds) / 2
+    span = max(1, (max_odds - min_odds) / 2)
+    return max(0.0, 1 - abs(odds - midpoint) / span)
+
+
+def rating_label(ev, edge):
+    if ev >= 0.03 and edge >= 0.02:
+        return "Playable"
+    if ev >= 0.0:
+        return "Thin Edge"
+    if ev >= -0.04:
+        return "Best Available"
+    if ev >= -0.10:
+        return "Risky"
+    return "Bad Price"
+
+
+def find_parlays(mode_key):
+    mode = MODE_CONFIG[mode_key]
     candidates = []
     market_counts = []
 
@@ -332,14 +329,13 @@ def find_parlays(mode_key, engine_key):
                     edge = sim_hit - break_even
                     ev = ev_per_dollar(sim_hit, odds)
                     line_value = ((l1["prob"] - p1) + (l2["prob"] - p2)) * -1
-
-                    if ev < engine["min_ev"]:
-                        continue
+                    price_score = price_fit_score(odds, mode_key)
 
                     score = (
                         sim_hit * mode["score_hit"]
                         + ev * mode["score_ev"]
                         + line_value * mode["score_line"]
+                        + price_score * mode["score_price"]
                     )
 
                     local_count += 1
@@ -375,6 +371,7 @@ def find_parlays(mode_key, engine_key):
                             "ev": ev,
                             "line_value": line_value,
                             "score": score,
+                            "rating": rating_label(ev, edge),
                         }
                     )
 
@@ -386,13 +383,8 @@ def find_parlays(mode_key, engine_key):
             }
         )
 
-    candidates.sort(key=lambda x: (x["score"], x["ev"], x["hit"], x["edge"]), reverse=True)
-
-    top = candidates[:TOP_N]
-    for idx, item in enumerate(top):
-        item["confidence"] = parlay_confidence(idx, mode_key)
-
-    return top, market_counts
+    candidates.sort(key=lambda x: (x["score"], x["hit"], x["ev"], x["edge"]), reverse=True)
+    return candidates[:TOP_N], market_counts
 
 
 HTML = """
@@ -401,7 +393,7 @@ HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Parlay Forge V6</title>
+  <title>Parlay Forge V7</title>
   <style>
     :root {
       --bg: #08080b;
@@ -424,8 +416,6 @@ HTML = """
     }
     .wrap { max-width: 1220px; margin: 0 auto; padding: 28px 18px 56px; }
     .hero {
-      position: relative;
-      overflow: hidden;
       border-radius: 28px;
       border: 1px solid var(--line);
       padding: 28px;
@@ -445,7 +435,7 @@ HTML = """
     h1 { margin: 0; font-size: 46px; line-height: 1; }
     .sub {
       margin: 12px 0 22px;
-      max-width: 900px;
+      max-width: 920px;
       color: var(--muted);
       line-height: 1.45;
     }
@@ -481,8 +471,6 @@ HTML = """
       margin-top: 22px;
     }
     .card {
-      position: relative;
-      overflow: hidden;
       border-radius: 24px;
       border: 1px solid var(--line);
       padding: 20px;
@@ -502,7 +490,7 @@ HTML = """
       letter-spacing: .16em;
       font-weight: 700;
     }
-    .confidence {
+    .rating {
       padding: 6px 10px;
       border-radius: 999px;
       font-size: 12px;
@@ -533,14 +521,6 @@ HTML = """
     }
     .team { font-size: 20px; font-weight: 800; margin-bottom: 4px; }
     .small { color: var(--muted); font-size: 14px; line-height: 1.45; }
-    .error {
-      margin-top: 20px;
-      padding: 16px;
-      border-radius: 18px;
-      border: 1px solid rgba(255,90,90,.25);
-      background: rgba(160,30,30,.12);
-      color: #ffb9b9;
-    }
     .summary {
       margin-top: 24px;
       border-radius: 20px;
@@ -566,29 +546,21 @@ HTML = """
 <body>
   <div class="wrap">
     <div class="hero">
-      <div class="eyebrow">Forge Mode // V6</div>
+      <div class="eyebrow">Forge Mode // V7</div>
       <h1>Parlay Forge</h1>
-      <p class="sub">Scans NBA, NFL, MLB, and UFC/MMA games in the next 24 hours. Checks FanDuel, DraftKings, BetMGM, and Caesars. Strict mode only shows positive-EV parlays. Action mode shows the best available top 5 even if they are slightly negative EV.</p>
+      <p class="sub">Always shows the top 5 available parlays. No strict hiding. You still get odds, sim hit rate, EV, and edge, but each parlay is labeled so you can see whether it looks playable, thin, risky, or like a bad price.</p>
       <form method="post" class="controls">
         <select name="mode">
           <option value="safe" {% if mode == 'safe' %}selected{% endif %}>Safe</option>
           <option value="balanced" {% if mode == 'balanced' %}selected{% endif %}>Balanced</option>
           <option value="aggressive" {% if mode == 'aggressive' %}selected{% endif %}>Aggressive</option>
         </select>
-        <select name="engine">
-          <option value="strict" {% if engine == 'strict' %}selected{% endif %}>Strict</option>
-          <option value="action" {% if engine == 'action' %}selected{% endif %}>Action</option>
-        </select>
-        <button type="submit">Forge V6 Parlays</button>
+        <button type="submit">Forge V7 Parlays</button>
       </form>
       {% if results is not none %}
-        <div class="meta">Mode: {{ mode_label }} · Engine: {{ engine_label }} · {{ engine_description }} · Simulations per candidate: {{ sim_count }} · Top results shown: {{ top_n }}</div>
+        <div class="meta">Mode: {{ mode_label }} · Window: {{ window_hours }} hours · Simulations per candidate: {{ sim_count }} · Top results shown: {{ top_n }}</div>
       {% endif %}
     </div>
-
-    {% if error %}
-      <div class="error">{{ error }}</div>
-    {% endif %}
 
     {% if results %}
       <div class="grid">
@@ -596,7 +568,7 @@ HTML = """
           <div class="card">
             <div class="rankrow">
               <div class="rank">Rank {{ loop.index }}</div>
-              <div class="confidence">{{ p.confidence }}</div>
+              <div class="rating">{{ p.rating }}</div>
             </div>
             <div class="odds">{{ p.odds_display }}</div>
             <div>
@@ -632,7 +604,7 @@ HTML = """
             <div class="summaryitem">
               <strong>{{ item.book }}</strong>
               <div class="small">Games found: {{ item.games }}</div>
-              <div class="small">Candidates shown: {{ item.candidates }}</div>
+              <div class="small">Candidates built: {{ item.candidates }}</div>
             </div>
           {% endfor %}
         </div>
@@ -648,40 +620,22 @@ HTML = """
 def home():
     results = None
     market_counts = None
-    error = None
     mode = request.form.get("mode", "balanced") if request.method == "POST" else "balanced"
-    engine = request.form.get("engine", "strict") if request.method == "POST" else "strict"
-
     if mode not in MODE_CONFIG:
         mode = "balanced"
-    if engine not in ENGINE_CONFIG:
-        engine = "strict"
 
     if request.method == "POST":
-        try:
-            results, market_counts = find_parlays(mode, engine)
-            if not results:
-                if engine == "strict":
-                    error = "No positive EV parlays found in the next 24 hours. No bet today."
-                else:
-                    error = "No parlays found in the next 24 hours for this mode."
-        except Exception as e:
-            error = str(e)
-            results = []
-            market_counts = []
+        results, market_counts = find_parlays(mode)
 
     return render_template_string(
         HTML,
         results=results,
         market_counts=market_counts,
-        error=error,
         mode=mode,
-        engine=engine,
         mode_label=MODE_CONFIG[mode]["label"],
-        engine_label=ENGINE_CONFIG[engine]["label"],
-        engine_description=ENGINE_CONFIG[engine]["description"],
         sim_count=f"{SIMULATION_COUNT:,}",
         top_n=TOP_N,
+        window_hours=WINDOW_HOURS,
     )
 
 
