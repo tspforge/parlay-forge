@@ -63,13 +63,24 @@ MODE_CONFIG = {
     },
 }
 
+ENGINE_CONFIG = {
+    "strict": {
+        "label": "Strict",
+        "min_ev": 0.0,
+        "description": "Only positive-EV parlays. No forcing action.",
+    },
+    "action": {
+        "label": "Action",
+        "min_ev": -0.05,
+        "description": "Best available parlays, even if slightly negative EV.",
+    },
+}
+
 WINDOW_HOURS = 24
 TOP_N = 5
 MAX_SINGLE_LEG_FAVORITE = -350
 app = Flask(__name__)
 
-
-# ---------------- MATH ----------------
 
 def american_to_decimal(american):
     if american > 0:
@@ -116,8 +127,6 @@ def format_american(american):
     return f"+{american}" if american > 0 else str(american)
 
 
-# ---------------- TIME ----------------
-
 def utc_now():
     return datetime.now(timezone.utc)
 
@@ -138,12 +147,9 @@ def within_window(commence):
         t = parse_time(commence)
     except Exception:
         return False
-
     now = utc_now()
     return now <= t <= now + timedelta(hours=WINDOW_HOURS)
 
-
-# ---------------- DATA FETCH ----------------
 
 def odds_api_get(url, params):
     r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
@@ -215,8 +221,6 @@ def fetch_games(book):
     return games
 
 
-# ---------------- MODEL HEURISTICS ----------------
-
 def sport_volatility(sport):
     if sport == "Mixed Martial Arts":
         return 0.11
@@ -231,7 +235,6 @@ def sport_volatility(sport):
 
 def infer_injury_risk(game, leg):
     risk = 0.0
-
     if game["sport"] == "American Football":
         if abs(leg["price"]) < 130:
             risk += 0.006
@@ -239,7 +242,6 @@ def infer_injury_risk(game, leg):
         risk += 0.008
     elif game["sport"] == "Mixed Martial Arts":
         risk += 0.010
-
     return risk
 
 
@@ -301,10 +303,9 @@ def parlay_confidence(rank_idx, mode_key):
     return names[mode_key][rank_idx]
 
 
-# ---------------- ENGINE ----------------
-
-def find_parlays(mode_key):
+def find_parlays(mode_key, engine_key):
     mode = MODE_CONFIG[mode_key]
+    engine = ENGINE_CONFIG[engine_key]
     candidates = []
     market_counts = []
 
@@ -332,8 +333,7 @@ def find_parlays(mode_key):
                     ev = ev_per_dollar(sim_hit, odds)
                     line_value = ((l1["prob"] - p1) + (l2["prob"] - p2)) * -1
 
-                    # V5 core rule: no negative EV bets
-                    if ev <= 0:
+                    if ev < engine["min_ev"]:
                         continue
 
                     score = (
@@ -395,15 +395,13 @@ def find_parlays(mode_key):
     return top, market_counts
 
 
-# ---------------- UI ----------------
-
 HTML = """
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Parlay Forge V5</title>
+  <title>Parlay Forge V6</title>
   <style>
     :root {
       --bg: #08080b;
@@ -447,7 +445,7 @@ HTML = """
     h1 { margin: 0; font-size: 46px; line-height: 1; }
     .sub {
       margin: 12px 0 22px;
-      max-width: 860px;
+      max-width: 900px;
       color: var(--muted);
       line-height: 1.45;
     }
@@ -568,19 +566,23 @@ HTML = """
 <body>
   <div class="wrap">
     <div class="hero">
-      <div class="eyebrow">Forge Mode // V5</div>
+      <div class="eyebrow">Forge Mode // V6</div>
       <h1>Parlay Forge</h1>
-      <p class="sub">Scans NBA, NFL, MLB, and UFC/MMA games in the next 24 hours. Checks FanDuel, DraftKings, BetMGM, and Caesars. Only shows positive-EV 2-leg parlays and filters out extreme chalk traps.</p>
+      <p class="sub">Scans NBA, NFL, MLB, and UFC/MMA games in the next 24 hours. Checks FanDuel, DraftKings, BetMGM, and Caesars. Strict mode only shows positive-EV parlays. Action mode shows the best available top 5 even if they are slightly negative EV.</p>
       <form method="post" class="controls">
         <select name="mode">
           <option value="safe" {% if mode == 'safe' %}selected{% endif %}>Safe</option>
           <option value="balanced" {% if mode == 'balanced' %}selected{% endif %}>Balanced</option>
           <option value="aggressive" {% if mode == 'aggressive' %}selected{% endif %}>Aggressive</option>
         </select>
-        <button type="submit">Forge V5 Parlays</button>
+        <select name="engine">
+          <option value="strict" {% if engine == 'strict' %}selected{% endif %}>Strict</option>
+          <option value="action" {% if engine == 'action' %}selected{% endif %}>Action</option>
+        </select>
+        <button type="submit">Forge V6 Parlays</button>
       </form>
       {% if results is not none %}
-        <div class="meta">Mode: {{ mode_label }} · Simulations per candidate: {{ sim_count }} · Top results shown: {{ top_n }}</div>
+        <div class="meta">Mode: {{ mode_label }} · Engine: {{ engine_label }} · {{ engine_description }} · Simulations per candidate: {{ sim_count }} · Top results shown: {{ top_n }}</div>
       {% endif %}
     </div>
 
@@ -630,7 +632,7 @@ HTML = """
             <div class="summaryitem">
               <strong>{{ item.book }}</strong>
               <div class="small">Games found: {{ item.games }}</div>
-              <div class="small">Positive-EV candidates: {{ item.candidates }}</div>
+              <div class="small">Candidates shown: {{ item.candidates }}</div>
             </div>
           {% endfor %}
         </div>
@@ -648,14 +650,21 @@ def home():
     market_counts = None
     error = None
     mode = request.form.get("mode", "balanced") if request.method == "POST" else "balanced"
+    engine = request.form.get("engine", "strict") if request.method == "POST" else "strict"
+
     if mode not in MODE_CONFIG:
         mode = "balanced"
+    if engine not in ENGINE_CONFIG:
+        engine = "strict"
 
     if request.method == "POST":
         try:
-            results, market_counts = find_parlays(mode)
+            results, market_counts = find_parlays(mode, engine)
             if not results:
-                error = "No positive EV parlays found in the next 24 hours. No bet today."
+                if engine == "strict":
+                    error = "No positive EV parlays found in the next 24 hours. No bet today."
+                else:
+                    error = "No parlays found in the next 24 hours for this mode."
         except Exception as e:
             error = str(e)
             results = []
@@ -667,7 +676,10 @@ def home():
         market_counts=market_counts,
         error=error,
         mode=mode,
+        engine=engine,
         mode_label=MODE_CONFIG[mode]["label"],
+        engine_label=ENGINE_CONFIG[engine]["label"],
+        engine_description=ENGINE_CONFIG[engine]["description"],
         sim_count=f"{SIMULATION_COUNT:,}",
         top_n=TOP_N,
     )
