@@ -1,573 +1,373 @@
-from flask import Flask, request, render_template_string
-from typing import List, Dict, Any
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from flask import Flask, request, jsonify, render_template_string
+import json
+import os
+import random
 
 app = Flask(__name__)
 
-LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+# --------------------------------------------------
+# Load fighter database
+# --------------------------------------------------
+DB_FILE = "fighters.json"
 
-# -------------------------------------------------------------------
-# SAMPLE DATA
-# Replace this later with your real odds/model feed.
-# IMPORTANT:
-# - game_time must be ISO format
-# - if no timezone offset is included, this app assumes UTC
-# Examples:
-#   "2026-03-13T19:00:00Z"
-#   "2026-03-13T19:00:00+00:00"
-#   "2026-03-13T19:00:00"   <-- treated as UTC by this app
-# -------------------------------------------------------------------
-BETS: List[Dict[str, Any]] = [
-    {
-        "team": "Detroit Pistons",
-        "odds": -1350,
-        "sim_hit": 89.50,
-        "ev": -3.87,
-        "matchup": "Memphis Grizzlies @ Detroit Pistons",
-        "sport": "NBA",
-        "book": "FanDuel",
-        "game_time": "2026-03-13T19:00:00Z",
-    },
-    {
-        "team": "Detroit Pistons",
-        "odds": -1200,
-        "sim_hit": 88.70,
-        "ev": -3.91,
-        "matchup": "Memphis Grizzlies @ Detroit Pistons",
-        "sport": "NBA",
-        "book": "DraftKings",
-        "game_time": "2026-03-13T19:00:00Z",
-    },
-    {
-        "team": "New York Knicks",
-        "odds": -800,
-        "sim_hit": 85.45,
-        "ev": -3.87,
-        "matchup": "New York Knicks @ Indiana Pacers",
-        "sport": "NBA",
-        "book": "FanDuel",
-        "game_time": "2026-03-13T20:00:00Z",
-    },
-    {
-        "team": "Boston Celtics",
-        "odds": -220,
-        "sim_hit": 72.10,
-        "ev": 3.25,
-        "matchup": "Boston Celtics @ Miami Heat",
-        "sport": "NBA",
-        "book": "DraftKings",
-        "game_time": "2026-03-20T19:30:00Z",
-    },
-    {
-        "team": "Denver Nuggets",
-        "odds": -145,
-        "sim_hit": 63.40,
-        "ev": 4.10,
-        "matchup": "Denver Nuggets @ Lakers",
-        "sport": "NBA",
-        "book": "FanDuel",
-        "game_time": "2026-03-13T22:00:00Z",
-    },
-    {
-        "team": "Sacramento Kings",
-        "odds": +120,
-        "sim_hit": 49.80,
-        "ev": 4.90,
-        "matchup": "Kings @ Suns",
-        "sport": "NBA",
-        "book": "DraftKings",
-        "game_time": "2026-03-13T21:30:00Z",
-    },
-    {
-        "team": "Minnesota Timberwolves",
-        "odds": +165,
-        "sim_hit": 43.00,
-        "ev": 6.75,
-        "matchup": "Timberwolves @ Thunder",
-        "sport": "NBA",
-        "book": "FanDuel",
-        "game_time": "2026-03-13T20:30:00Z",
-    },
-    {
-        "team": "Cleveland Cavaliers",
-        "odds": +210,
-        "sim_hit": 38.10,
-        "ev": 8.30,
-        "matchup": "Cavaliers @ Bucks",
-        "sport": "NBA",
-        "book": "DraftKings",
-        "game_time": "2026-03-13T19:30:00Z",
-    },
-    {
-        "team": "Seattle Kraken",
-        "odds": +145,
-        "sim_hit": 45.20,
-        "ev": 7.10,
-        "matchup": "Kraken @ Canucks",
-        "sport": "NHL",
-        "book": "FanDuel",
-        "game_time": "2026-03-13T22:30:00Z",
-    },
-    {
-        "team": "Texas Rangers",
-        "odds": -115,
-        "sim_hit": 57.60,
-        "ev": 3.40,
-        "matchup": "Rangers @ Astros",
-        "sport": "MLB",
-        "book": "DraftKings",
-        "game_time": "2026-03-13T18:45:00Z",
-    },
-]
+if os.path.exists(DB_FILE):
+    with open(DB_FILE, "r", encoding="utf-8") as f:
+        fighter_list = json.load(f)
+else:
+    fighter_list = []
 
-HTML = """
+fighters = {}
+for fighter in fighter_list:
+    name = fighter.get("name")
+    if name:
+        fighters[name] = fighter
+
+# --------------------------------------------------
+# Helpers
+# --------------------------------------------------
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def get_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def normalize_fighter_stats(f):
+    """
+    Convert scraped stats into model-friendly values.
+    """
+    slpm = get_float(f.get("slpm"), 2.5)
+    sapm = get_float(f.get("sapm"), 2.5)
+    str_acc = get_float(f.get("str_acc"), 45.0)
+    str_def = get_float(f.get("str_def"), 50.0)
+    td_avg = get_float(f.get("td_avg"), 0.5)
+    td_acc = get_float(f.get("td_acc"), 35.0)
+    td_def = get_float(f.get("td_def"), 55.0)
+    sub_avg = get_float(f.get("sub_avg"), 0.2)
+
+    total_fights = int(get_float(f.get("total_fights"), 1))
+    wins = int(get_float(f.get("wins"), 0))
+
+    ko_rate = get_float(f.get("ko_rate"), 0.20)
+    sub_rate = get_float(f.get("sub_rate"), 0.10)
+    decision_rate = get_float(f.get("decision_rate"), 0.70)
+    finish_rate = get_float(f.get("finish_rate"), ko_rate + sub_rate)
+
+    # Basic quality / experience factor
+    win_rate = wins / total_fights if total_fights > 0 else 0.5
+    experience_factor = clamp(total_fights / 20.0, 0.4, 1.2)
+
+    return {
+        "name": f.get("name", "Unknown"),
+        "slpm": slpm,
+        "sapm": sapm,
+        "str_acc": str_acc,
+        "str_def": str_def,
+        "td_avg": td_avg,
+        "td_acc": td_acc,
+        "td_def": td_def,
+        "sub_avg": sub_avg,
+        "ko_rate": ko_rate,
+        "sub_rate": sub_rate,
+        "decision_rate": decision_rate,
+        "finish_rate": finish_rate,
+        "win_rate": win_rate,
+        "experience_factor": experience_factor,
+        "total_fights": total_fights,
+        "wins": wins,
+        "losses": int(get_float(f.get("losses"), 0)),
+        "draws": int(get_float(f.get("draws"), 0)),
+    }
+
+
+def build_matchup_probabilities(a_raw, b_raw, rounds):
+    """
+    Derive win/method probabilities from real stats.
+    This is still a simplified model, but much better than hardcoded values.
+    """
+    a = normalize_fighter_stats(a_raw)
+    b = normalize_fighter_stats(b_raw)
+
+    # Striking advantage
+    a_strike_score = (
+        (a["slpm"] * (a["str_acc"] / 100.0))
+        - (b["sapm"] * (b["str_def"] / 100.0))
+    )
+    b_strike_score = (
+        (b["slpm"] * (b["str_acc"] / 100.0))
+        - (a["sapm"] * (a["str_def"] / 100.0))
+    )
+
+    # Grappling advantage
+    a_grapple_score = (a["td_avg"] * (a["td_acc"] / 100.0)) - (b["td_def"] / 100.0)
+    b_grapple_score = (b["td_avg"] * (b["td_acc"] / 100.0)) - (a["td_def"] / 100.0)
+
+    # Base total strength
+    a_total = (
+        a_strike_score * 1.2
+        + a_grapple_score * 0.9
+        + a["win_rate"] * 1.0
+        + a["experience_factor"] * 0.5
+    )
+
+    b_total = (
+        b_strike_score * 1.2
+        + b_grapple_score * 0.9
+        + b["win_rate"] * 1.0
+        + b["experience_factor"] * 0.5
+    )
+
+    # Convert to relative win probabilities
+    raw_a = max(0.05, a_total + 2.5)
+    raw_b = max(0.05, b_total + 2.5)
+    total = raw_a + raw_b
+
+    a_win_prob = raw_a / total
+    b_win_prob = raw_b / total
+
+    # 5 rounds = slightly more finish opportunities and also more decision exposure for better fighters
+    if rounds == 5:
+        a_finish_bias = 1.08
+        b_finish_bias = 1.08
+        a_decision_bias = 1.05
+        b_decision_bias = 1.05
+    else:
+        a_finish_bias = 1.00
+        b_finish_bias = 1.00
+        a_decision_bias = 1.00
+        b_decision_bias = 1.00
+
+    # Method mix inside each fighter's win condition
+    a_ko_weight = max(0.01, a["ko_rate"] * (1 + max(0, a_strike_score) * 0.10)) * a_finish_bias
+    a_sub_weight = max(0.01, a["sub_rate"] * (1 + max(0, a_grapple_score) * 0.15)) * a_finish_bias
+    a_dec_weight = max(0.01, a["decision_rate"]) * a_decision_bias
+
+    b_ko_weight = max(0.01, b["ko_rate"] * (1 + max(0, b_strike_score) * 0.10)) * b_finish_bias
+    b_sub_weight = max(0.01, b["sub_rate"] * (1 + max(0, b_grapple_score) * 0.15)) * b_finish_bias
+    b_dec_weight = max(0.01, b["decision_rate"]) * b_decision_bias
+
+    a_method_total = a_ko_weight + a_sub_weight + a_dec_weight
+    b_method_total = b_ko_weight + b_sub_weight + b_dec_weight
+
+    probs = {
+        f'{a["name"]} KO/TKO': a_win_prob * (a_ko_weight / a_method_total),
+        f'{a["name"]} Submission': a_win_prob * (a_sub_weight / a_method_total),
+        f'{a["name"]} Decision': a_win_prob * (a_dec_weight / a_method_total),
+        f'{b["name"]} KO/TKO': b_win_prob * (b_ko_weight / b_method_total),
+        f'{b["name"]} Submission': b_win_prob * (b_sub_weight / b_method_total),
+        f'{b["name"]} Decision': b_win_prob * (b_dec_weight / b_method_total),
+    }
+
+    return probs
+
+
+def simulate_fight(fighter_a, fighter_b, rounds):
+    probs = build_matchup_probabilities(fighters[fighter_a], fighters[fighter_b], rounds)
+    outcomes = list(probs.keys())
+    weights = list(probs.values())
+    return random.choices(outcomes, weights=weights, k=1)[0]
+
+
+def monte_carlo(fighter_a, fighter_b, rounds, runs):
+    method_counts = {
+        f"{fighter_a} KO/TKO": 0,
+        f"{fighter_a} Submission": 0,
+        f"{fighter_a} Decision": 0,
+        f"{fighter_b} KO/TKO": 0,
+        f"{fighter_b} Submission": 0,
+        f"{fighter_b} Decision": 0,
+    }
+
+    for _ in range(runs):
+        outcome = simulate_fight(fighter_a, fighter_b, rounds)
+        method_counts[outcome] += 1
+
+    method_percentages = {
+        outcome: round((count / runs) * 100, 2)
+        for outcome, count in method_counts.items()
+    }
+
+    fighter_a_win_pct = round(
+        method_percentages[f"{fighter_a} KO/TKO"]
+        + method_percentages[f"{fighter_a} Submission"]
+        + method_percentages[f"{fighter_a} Decision"],
+        2
+    )
+
+    fighter_b_win_pct = round(
+        method_percentages[f"{fighter_b} KO/TKO"]
+        + method_percentages[f"{fighter_b} Submission"]
+        + method_percentages[f"{fighter_b} Decision"],
+        2
+    )
+
+    ranked_methods = dict(
+        sorted(method_percentages.items(), key=lambda x: x[1], reverse=True)
+    )
+
+    return {
+        "fight": f"{fighter_a} vs {fighter_b}",
+        "rounds": rounds,
+        "simulations": runs,
+        "win_percentages": {
+            fighter_a: fighter_a_win_pct,
+            fighter_b: fighter_b_win_pct
+        },
+        "method_breakdown": ranked_methods
+    }
+
+
+# --------------------------------------------------
+# UI
+# --------------------------------------------------
+HOME_HTML = """
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Parlay Forge</title>
+    <title>UFC Sim</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        * { box-sizing: border-box; }
         body {
-            margin: 0;
-            background: #06080d;
-            color: #f3f6fb;
             font-family: Arial, sans-serif;
+            background: #0b0d12;
+            color: white;
+            margin: 0;
+            padding: 40px 20px;
         }
         .wrap {
-            max-width: 1480px;
+            max-width: 900px;
             margin: 0 auto;
-            padding: 34px 36px 80px;
         }
         h1 {
-            margin: 0 0 18px;
-            font-size: 54px;
-            line-height: 1;
+            margin-top: 0;
+            font-size: 48px;
         }
-        .sub {
-            margin: 0 0 24px;
-            color: #9fb0c5;
-            font-size: 15px;
+        p {
+            color: #b9c0cc;
         }
         form {
-            display: flex;
-            gap: 12px;
-            align-items: center;
-            margin-bottom: 24px;
-            flex-wrap: wrap;
+            background: #161a22;
+            padding: 24px;
+            border-radius: 16px;
+            margin-top: 20px;
         }
-        select, button {
-            height: 50px;
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+        }
+        select, input, button {
+            width: 100%;
+            padding: 14px;
+            margin-bottom: 18px;
             border-radius: 10px;
             border: none;
-            font-size: 18px;
-        }
-        select {
-            min-width: 180px;
-            padding: 0 14px;
+            font-size: 16px;
         }
         button {
             background: #ff9800;
-            color: #000;
-            font-weight: 800;
-            padding: 0 24px;
+            color: black;
+            font-weight: bold;
             cursor: pointer;
         }
-        .checkbox-wrap {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            color: #dbe4f0;
-            font-size: 15px;
-            padding: 0 8px;
+        .links {
+            margin-top: 30px;
         }
-        .checkbox-wrap input {
-            transform: scale(1.15);
-        }
-        .status-bar {
-            display: flex;
-            gap: 12px;
-            flex-wrap: wrap;
-            margin: 0 0 26px;
-        }
-        .pill {
-            background: #171c27;
-            color: #a9bbd1;
-            border: 1px solid #242c3c;
-            padding: 9px 14px;
-            border-radius: 999px;
-            font-size: 13px;
-            font-weight: 700;
-            letter-spacing: .03em;
-        }
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-            gap: 18px;
-        }
-        .card {
-            background: #151922;
-            border: 1px solid #232a38;
-            border-radius: 20px;
-            padding: 22px 22px 20px;
-            box-shadow: 0 10px 28px rgba(0,0,0,.18);
-        }
-        .topline {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 14px;
-        }
-        .mode-tag {
-            display: inline-block;
-            background: #232a38;
-            color: #9fb0c5;
-            border-radius: 999px;
-            padding: 6px 10px;
-            font-size: 11px;
-            font-weight: 800;
-            letter-spacing: .08em;
-            text-transform: uppercase;
-        }
-        .edge-tag {
-            display: inline-block;
-            border-radius: 999px;
-            padding: 6px 10px;
-            font-size: 11px;
-            font-weight: 800;
-            letter-spacing: .08em;
-            text-transform: uppercase;
-        }
-        .edge-elite { background: rgba(0, 200, 120, .18); color: #72f0aa; }
-        .edge-strong { background: rgba(100, 180, 255, .18); color: #85c7ff; }
-        .edge-ok { background: rgba(255, 180, 0, .18); color: #ffc861; }
-
-        .team {
-            font-size: 34px;
-            font-weight: 900;
-            line-height: 1.05;
-            margin: 0 0 8px;
-        }
-        .matchup {
-            color: #b8c5d6;
-            font-size: 16px;
-            margin-bottom: 6px;
-        }
-        .gametime {
-            color: #8fa0b5;
-            font-size: 14px;
-            margin-bottom: 12px;
-        }
-        .meta {
-            display: grid;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 10px;
-            margin: 14px 0 18px;
-        }
-        .stat {
-            background: #0f131b;
-            border: 1px solid #222938;
-            border-radius: 14px;
-            padding: 12px 14px;
-        }
-        .label {
-            color: #8fa0b5;
-            font-size: 12px;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: .08em;
-            margin-bottom: 6px;
-        }
-        .value {
-            font-size: 22px;
-            font-weight: 800;
-        }
-        .ev-pos { color: #6bea9f; }
-        .ev-neg { color: #ff7e7e; }
-
-        .why {
-            background: #0f131b;
-            border: 1px solid #222938;
-            border-radius: 14px;
-            padding: 14px;
-        }
-        .why h3 {
-            margin: 0 0 10px;
-            font-size: 14px;
-            color: #9fb0c5;
-            text-transform: uppercase;
-            letter-spacing: .08em;
-        }
-        .why ul {
-            margin: 0;
-            padding-left: 18px;
-            color: #dbe4f0;
-            line-height: 1.6;
-            font-size: 15px;
-        }
-        .empty {
-            color: #a9bbd1;
-            font-size: 18px;
-            margin-top: 20px;
-        }
-        .hint {
-            margin-top: 18px;
-            color: #8898ae;
-            font-size: 14px;
+        a {
+            color: #7db7ff;
         }
     </style>
 </head>
 <body>
     <div class="wrap">
-        <h1>Parlay Forge</h1>
-        <p class="sub">Mode-aware picks with EV filtering, market edge, and only games starting in the next 24 hours (Pacific time).</p>
+        <h1>UFC Fight Simulator</h1>
+        <p>Real fighter database loaded from fighters.json</p>
+        <p>Fighters in database: <strong>{{ fighter_count }}</strong></p>
 
-        <form method="GET" action="/">
-            <select name="mode">
-                <option value="safe" {% if mode == "safe" %}selected{% endif %}>Safe</option>
-                <option value="balanced" {% if mode == "balanced" %}selected{% endif %}>Balanced</option>
-                <option value="aggressive" {% if mode == "aggressive" %}selected{% endif %}>Aggressive</option>
+        <form action="/simulate" method="get">
+            <label for="fighter_a">Fighter A</label>
+            <select name="fighter_a" id="fighter_a">
+                {% for fighter in fighter_names %}
+                <option value="{{ fighter }}">{{ fighter }}</option>
+                {% endfor %}
             </select>
 
-            <label class="checkbox-wrap">
-                <input type="checkbox" name="edge_only" value="1" {% if edge_only %}checked{% endif %}>
-                Edge only (EV > 0)
-            </label>
+            <label for="fighter_b">Fighter B</label>
+            <select name="fighter_b" id="fighter_b">
+                {% for fighter in fighter_names %}
+                <option value="{{ fighter }}">{{ fighter }}</option>
+                {% endfor %}
+            </select>
 
-            <button type="submit">Forge</button>
+            <label for="rounds">Rounds</label>
+            <select name="rounds" id="rounds">
+                <option value="3">3 Rounds</option>
+                <option value="5">5 Rounds</option>
+            </select>
+
+            <label for="runs">Simulations</label>
+            <input type="number" name="runs" id="runs" value="100000" min="1000" step="1000">
+
+            <button type="submit">Run Simulation</button>
         </form>
 
-        <div class="status-bar">
-            <div class="pill">Mode: {{ mode|capitalize }}</div>
-            <div class="pill">Edge Filter: {{ "On" if edge_only else "Off" }}</div>
-            <div class="pill">Now (PT): {{ now_display }}</div>
-            <div class="pill">Results: {{ bets|length }}</div>
-        </div>
-
-        {% if bets %}
-            <div class="grid">
-                {% for bet in bets %}
-                    <div class="card">
-                        <div class="topline">
-                            <span class="mode-tag">{{ mode|capitalize }}</span>
-                            <span class="edge-tag {{ bet.edge_class }}">{{ bet.edge_label }}</span>
-                        </div>
-
-                        <div class="team">{{ bet.team }}</div>
-                        <div class="matchup">{{ bet.matchup }} • {{ bet.sport }} • {{ bet.book }}</div>
-                        <div class="gametime">Starts: {{ bet.game_time_display }}</div>
-
-                        <div class="meta">
-                            <div class="stat">
-                                <div class="label">Odds</div>
-                                <div class="value">{{ bet.odds_display }}</div>
-                            </div>
-                            <div class="stat">
-                                <div class="label">Model Hit Rate</div>
-                                <div class="value">{{ "%.2f"|format(bet.sim_hit) }}%</div>
-                            </div>
-                            <div class="stat">
-                                <div class="label">Market Implied</div>
-                                <div class="value">{{ "%.2f"|format(bet.implied_prob) }}%</div>
-                            </div>
-                            <div class="stat">
-                                <div class="label">Model Edge</div>
-                                <div class="value {% if bet.edge >= 0 %}ev-pos{% else %}ev-neg{% endif %}">
-                                    {{ "%+.2f"|format(bet.edge) }}%
-                                </div>
-                            </div>
-                            <div class="stat">
-                                <div class="label">EV</div>
-                                <div class="value {% if bet.ev >= 0 %}ev-pos{% else %}ev-neg{% endif %}">
-                                    {{ "%+.2f"|format(bet.ev) }}%
-                                </div>
-                            </div>
-                            <div class="stat">
-                                <div class="label">Confidence</div>
-                                <div class="value">{{ bet.confidence }}</div>
-                            </div>
-                        </div>
-
-                        <div class="why">
-                            <h3>Why this bet made the board</h3>
-                            <ul>
-                                {% for line in bet.reasons %}
-                                    <li>{{ line }}</li>
-                                {% endfor %}
-                            </ul>
-                        </div>
-                    </div>
-                {% endfor %}
-            </div>
-        {% else %}
-            <div class="empty">
-                No bets matched this mode/filter combo in the next 24 hours.
-            </div>
-        {% endif %}
-
-        <div class="hint">
-            Safe = heavy favorites. Balanced = tighter prices. Aggressive = plus-money / bigger swings.
+        <div class="links">
+            <p>Quick test:</p>
+            <a href="/simulate?fighter_a=Max Holloway&fighter_b=Charles Oliveira&rounds=5&runs=100000">Max Holloway vs Charles Oliveira</a>
         </div>
     </div>
 </body>
 </html>
 """
 
-def american_to_implied_prob(odds: int) -> float:
-    if odds < 0:
-        return (abs(odds) / (abs(odds) + 100)) * 100
-    return (100 / (odds + 100)) * 100
 
-
-def format_american_odds(odds: int) -> str:
-    return f"+{odds}" if odds > 0 else str(odds)
-
-
-def confidence_label(sim_hit: float) -> str:
-    if sim_hit >= 75:
-        return "Very High"
-    if sim_hit >= 62:
-        return "High"
-    if sim_hit >= 50:
-        return "Moderate"
-    return "Volatile"
-
-
-def edge_label(edge: float) -> tuple[str, str]:
-    if edge >= 7:
-        return "Elite Edge", "edge-elite"
-    if edge >= 4:
-        return "Strong Edge", "edge-strong"
-    return "Playable", "edge-ok"
-
-
-def mode_filter(mode: str, odds: int) -> bool:
-    if mode == "safe":
-        return odds <= -180
-    if mode == "balanced":
-        return -179 <= odds <= 140
-    if mode == "aggressive":
-        return odds >= 100
-    return True
-
-
-def parse_game_time_to_local(game_time_str: str) -> datetime:
-    """
-    Parse ISO string and convert to Pacific time.
-    If timezone is missing, assume UTC.
-    """
-    s = game_time_str.strip().replace("Z", "+00:00")
-    dt = datetime.fromisoformat(s)
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-
-    return dt.astimezone(LOCAL_TZ)
-
-
-def is_within_next_24h(game_time_str: str) -> bool:
-    game_local = parse_game_time_to_local(game_time_str)
-    now_local = datetime.now(LOCAL_TZ)
-    cutoff = now_local + timedelta(hours=24)
-    return now_local <= game_local <= cutoff
-
-
-def format_game_time(game_time_str: str) -> str:
-    dt = parse_game_time_to_local(game_time_str)
-    return dt.strftime("%b %d, %I:%M %p PT")
-
-
-def build_reasons(bet: Dict[str, Any]) -> List[str]:
-    reasons: List[str] = []
-
-    if bet["edge"] >= 7:
-        reasons.append("Model is significantly higher than the market price.")
-    elif bet["edge"] >= 4:
-        reasons.append("Model shows a meaningful edge over the market.")
-    else:
-        reasons.append("Model has this side slightly above market.")
-
-    if bet["ev"] > 0:
-        reasons.append("Expected value is positive, so it passes the edge filter.")
-    else:
-        reasons.append("Expected value is negative, so this is more of a confidence play than a value play.")
-
-    if bet["odds"] <= -180:
-        reasons.append("Price profile fits a safer parlay leg or anchor.")
-    elif -179 <= bet["odds"] <= 140:
-        reasons.append("Price profile fits a balanced single or mid-risk parlay piece.")
-    else:
-        reasons.append("Price profile fits an aggressive play with higher upside.")
-
-    return reasons
-
-
-def enrich_bet(bet: Dict[str, Any]) -> Dict[str, Any]:
-    implied_prob = american_to_implied_prob(bet["odds"])
-    edge = bet["sim_hit"] - implied_prob
-    label, css = edge_label(edge)
-
-    enriched = dict(bet)
-    enriched["implied_prob"] = implied_prob
-    enriched["edge"] = edge
-    enriched["edge_label"] = label
-    enriched["edge_class"] = css
-    enriched["odds_display"] = format_american_odds(bet["odds"])
-    enriched["confidence"] = confidence_label(bet["sim_hit"])
-    enriched["game_time_display"] = format_game_time(bet["game_time"])
-    enriched["game_time_local_dt"] = parse_game_time_to_local(bet["game_time"])
-    enriched["reasons"] = build_reasons(
-        {
-            **bet,
-            "implied_prob": implied_prob,
-            "edge": edge,
-        }
-    )
-    return enriched
-
-
-@app.route("/", methods=["GET"])
+@app.route("/")
 def home():
-    mode = request.args.get("mode", "safe").strip().lower()
-    edge_only = request.args.get("edge_only") == "1"
-
-    valid_modes = {"safe", "balanced", "aggressive"}
-    if mode not in valid_modes:
-        mode = "safe"
-
-    filtered: List[Dict[str, Any]] = []
-
-    for bet in BETS:
-        if not is_within_next_24h(bet["game_time"]):
-            continue
-
-        if not mode_filter(mode, bet["odds"]):
-            continue
-
-        enriched = enrich_bet(bet)
-
-        if edge_only and enriched["ev"] <= 0:
-            continue
-
-        filtered.append(enriched)
-
-    filtered.sort(
-        key=lambda x: (x["game_time_local_dt"], -x["ev"], -x["edge"])
-    )
-
-    now_local = datetime.now(LOCAL_TZ)
-
+    fighter_names = sorted(fighters.keys())
     return render_template_string(
-        HTML,
-        bets=filtered,
-        mode=mode,
-        edge_only=edge_only,
-        now_display=now_local.strftime("%b %d, %I:%M %p"),
+        HOME_HTML,
+        fighter_names=fighter_names,
+        fighter_count=len(fighter_names),
     )
+
+
+@app.route("/simulate")
+def simulate():
+    fighter_a = request.args.get("fighter_a")
+    fighter_b = request.args.get("fighter_b")
+    rounds = int(request.args.get("rounds", 3))
+    runs = int(request.args.get("runs", 100000))
+
+    if fighter_a not in fighters or fighter_b not in fighters:
+        return jsonify({
+            "error": "fighter not found",
+            "available_fighters_sample": sorted(list(fighters.keys()))[:25]
+        }), 400
+
+    if fighter_a == fighter_b:
+        return jsonify({
+            "error": "fighter_a and fighter_b must be different"
+        }), 400
+
+    if rounds not in [3, 5]:
+        return jsonify({
+            "error": "rounds must be 3 or 5"
+        }), 400
+
+    if runs <= 0:
+        return jsonify({
+            "error": "runs must be greater than 0"
+        }), 400
+
+    results = monte_carlo(fighter_a, fighter_b, rounds, runs)
+    return jsonify(results)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000, debug=True)
+    app.run(host="0.0.0.0", port=10000)
