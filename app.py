@@ -69,7 +69,14 @@ MODE_CONFIG = {
 WINDOW_HOURS = 48
 TOP_N = 5
 MAX_SINGLE_LEG_FAVORITE = -600
-SAFE_SINGLE_MIN_HIT = 0.70
+
+SINGLE_MODE_THRESHOLDS = {
+    "safe": 0.70,
+    "balanced": 0.50,
+    "aggressive": 0.30,
+}
+
+AGGRESSIVE_MIN_PRICE = 120
 
 app = Flask(__name__)
 
@@ -311,14 +318,40 @@ def parlay_rating_label(ev, edge):
     return "Bad Price"
 
 
-def single_rating_label(hit, ev):
-    if hit >= 0.80 and ev >= 0:
-        return "Hammer Safe"
-    if hit >= 0.75:
-        return "Very Safe"
-    if hit >= 0.70:
+def single_rating_label(hit, ev, mode_key):
+    if mode_key == "safe":
+        if hit >= 0.80 and ev >= 0:
+            return "Hammer Safe"
+        if hit >= 0.75:
+            return "Very Safe"
         return "Safe"
-    return "Not Safe"
+
+    if mode_key == "balanced":
+        if hit >= 0.60 and ev >= 0:
+            return "Balanced+"
+        if hit >= 0.50:
+            return "Balanced"
+        return "Thin"
+
+    if ev >= 0.05:
+        return "Aggressive EV"
+    if ev >= 0.0:
+        return "Plus Money"
+    return "Swing"
+
+
+def single_score(sim_hit, ev, edge, price, mode_key):
+    if mode_key == "safe":
+        return (sim_hit * 0.75) + (ev * 0.15) + (edge * 0.10)
+
+    if mode_key == "balanced":
+        return (sim_hit * 0.50) + (ev * 0.30) + (edge * 0.20)
+
+    plus_money_bonus = 0.0
+    if price > 0:
+        plus_money_bonus = min(price / 1000, 0.25)
+
+    return (ev * 0.55) + (edge * 0.20) + (sim_hit * 0.15) + plus_money_bonus
 
 
 def find_safe_singles(mode_key):
@@ -337,14 +370,17 @@ def find_safe_singles(mode_key):
                 adj_prob = adjust_probability(game, leg, mode_key)
                 sim_hit = simulate_single(adj_prob, SIMULATION_COUNT)
 
-                if sim_hit < SAFE_SINGLE_MIN_HIT:
+                min_hit = SINGLE_MODE_THRESHOLDS[mode_key]
+                if sim_hit < min_hit:
+                    continue
+
+                if mode_key == "aggressive" and leg["price"] < AGGRESSIVE_MIN_PRICE:
                     continue
 
                 break_even = break_even_prob(leg["price"])
                 edge = sim_hit - break_even
                 ev = ev_per_dollar(sim_hit, leg["price"])
-
-                score = (sim_hit * 0.72) + (ev * 0.20) + (edge * 0.08)
+                score = single_score(sim_hit, ev, edge, leg["price"], mode_key)
 
                 local_count += 1
                 singles.append(
@@ -357,7 +393,7 @@ def find_safe_singles(mode_key):
                         "ev": ev,
                         "edge": edge,
                         "score": score,
-                        "rating": single_rating_label(sim_hit, ev),
+                        "rating": single_rating_label(sim_hit, ev, mode_key),
                         "sport": game["sport"],
                         "game": game["game"],
                         "time": game["display_time"],
@@ -470,7 +506,7 @@ HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Parlay Forge V8</title>
+  <title>Parlay Forge V8.1</title>
   <style>
     :root {
       --bg: #08080b;
@@ -623,20 +659,20 @@ HTML = """
 <body>
   <div class="wrap">
     <div class="hero">
-      <div class="eyebrow">Forge Mode // V8</div>
+      <div class="eyebrow">Forge Mode // V8.1</div>
       <h1>Parlay Forge</h1>
-      <p class="sub">Safe Singles only returns bets with at least 70% simulated hit rate. Parlay Scanner keeps the ranked 2-leg parlay view. This is much closer to what you meant by safe.</p>
+      <p class="sub">Safe singles now actually change by mode. Safe focuses on 70%+ hit rate. Balanced focuses on 50%+. Aggressive hunts plus-money EV and allows lower hit rate.</p>
       <form method="post" class="controls">
         <select name="bet_type">
-          <option value="singles" {% if bet_type == 'singles' %}selected{% endif %}>Safe Singles</option>
-          <option value="parlays" {% if bet_type == 'parlays' %}selected{% endif %}>Parlay Scanner</option>
+          <option value="singles" {% if bet_type == 'singles' %}selected{% endif %}>Singles</option>
+          <option value="parlays" {% if bet_type == 'parlays' %}selected{% endif %}>Parlays</option>
         </select>
         <select name="mode">
           <option value="safe" {% if mode == 'safe' %}selected{% endif %}>Safe</option>
           <option value="balanced" {% if mode == 'balanced' %}selected{% endif %}>Balanced</option>
           <option value="aggressive" {% if mode == 'aggressive' %}selected{% endif %}>Aggressive</option>
         </select>
-        <button type="submit">Forge V8</button>
+        <button type="submit">Forge V8.1</button>
       </form>
       {% if results is not none %}
         <div class="meta">Bet type: {{ bet_type_label }} · Mode: {{ mode_label }} · Window: {{ window_hours }} hours · Simulations: {{ sim_count }} · Top shown: {{ top_n }}</div>
@@ -740,7 +776,7 @@ def home():
         mode=mode,
         bet_type=bet_type,
         mode_label=MODE_CONFIG[mode]["label"],
-        bet_type_label="Safe Singles" if bet_type == "singles" else "Parlay Scanner",
+        bet_type_label="Singles" if bet_type == "singles" else "Parlays",
         sim_count=f"{SIMULATION_COUNT:,}",
         top_n=TOP_N,
         window_hours=WINDOW_HOURS,
